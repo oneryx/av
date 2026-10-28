@@ -1,0 +1,68 @@
+version: '3'
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+  STATICCHECK: honnef.co/go/tools/cmd/staticcheck@v0.8.2
+  GOVULNCHECK: golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  build:
+    desc: Build bin/av
+    cmds:
+      - go build -ldflags "{{.LDFLAGS}}" -o bin/av ./cmd/av
+
+  install:
+    desc: Install av into $GOBIN (or $GOPATH/bin)
+    cmds:
+      - go install -ldflags "{{.LDFLAGS}}" ./cmd/av
+
+  test:
+    desc: Run the tests
+    cmds:
+      - go test ./...
+
+  test:race:
+    desc: Run the tests with the race detector (as CI does)
+    cmds:
+      - go test -race ./...
+
+  fmt:
+    desc: Fail if any file isn't gofmt'ed
+    cmds:
+      - |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then echo "Not gofmt'ed:"; echo "$unformatted"; exit 1; fi
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  staticcheck:
+    desc: Run staticcheck
+    cmds:
+      - go run {{.STATICCHECK}} ./...
+
+  vulncheck:
+    desc: Check for known vulnerabilities in reachable code
+    cmds:
+      - go run {{.GOVULNCHECK}} ./...
+
+  lint:
+    desc: Run all static checks (gofmt, vet, staticcheck, govulncheck)
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: staticcheck
+      - task: vulncheck
+
+  clean:
+    desc: Remove build output
+    cmds:
+      - rm -rf bin

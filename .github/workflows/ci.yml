@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install age (for the interop test)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y age
+      - uses: go-task/setup-task@v1
+      - run: task lint
+      - run: task test:race
+      - run: task build && ./bin/av version

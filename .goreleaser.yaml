@@ -1,0 +1,31 @@
+# Builds and publishes a GitHub release when a v* tag is pushed
+# (.github/workflows/release.yml). Try it locally with:
+#   goreleaser release --snapshot --clean
+version: 2
+
+project_name: av
+
+builds:
+  - main: ./cmd/av
+    binary: av
+    env:
+      - CGO_ENABLED=0
+    # av needs sh and /dev/tty, so no Windows build.
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    # Same version string as the Taskfile: the tag, e.g. "v0.0.1".
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
