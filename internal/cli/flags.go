@@ -18,6 +18,7 @@ type options struct {
 	passphrase     bool
 	from           string
 	force          bool
+	recipientsPath string
 }
 
 func addFileFlag(fs *pflag.FlagSet, o *options) {
@@ -26,6 +27,10 @@ func addFileFlag(fs *pflag.FlagSet, o *options) {
 
 func addIdentityFlag(fs *pflag.FlagSet, o *options) {
 	fs.StringArrayVarP(&o.identities, "identity", "i", nil, "identity `PATH` for decryption (repeatable)")
+}
+
+func addRecipientsPathFlag(fs *pflag.FlagSet, o *options) {
+	fs.StringVar(&o.recipientsPath, "recipients-path", "", "recipients `FILE` (default $AV_RECIPIENTS, then recipients.txt in the current directory or next to keys.txt)")
 }
 
 func addRecipientFlags(fs *pflag.FlagSet, o *options, verb string) {
@@ -90,6 +95,15 @@ func EncPath(p string) string {
 		return p + ".age"
 	}
 	return p + ".env.age"
+}
+
+// editPath is EncPath, except that an existing *.age file is used as given,
+// so `edit` and `print` work on any age file (README.md.age), not only *.env.age ones.
+func editPath(p string) string {
+	if p != "" && strings.HasSuffix(p, ".age") && fileExists(p) {
+		return p
+	}
+	return EncPath(p)
 }
 
 func dedupe(in []string) []string {

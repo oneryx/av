@@ -74,10 +74,12 @@ Identities:
     ~/.ssh/id_rsa that exist.
 
 Recipients:
-    Recipients used with av new / av edit are saved next to the encrypted
-    file as <file>.recipients (public keys only, safe to commit), and reused
-    by later edits. Every save prints who the file is encrypted to.
-    Passphrase-encrypted files keep their passphrase on edit.
+    Recipients are kept in one file, recipients.txt (public keys only, safe to
+    commit). The file is --recipients-path, else $AV_RECIPIENTS, else
+    recipients.txt in the current directory, else next to keys.txt. av new
+    creates ./recipients.txt if none exists. Every save prints who it is
+    encrypted to. Passphrase-encrypted files keep their passphrase on edit.
+    Show the file with: av recipients print
 
 Using the variables:
     av run -- npm start           # only the command sees the variables

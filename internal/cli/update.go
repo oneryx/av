@@ -44,9 +44,9 @@ func (c *CLI) update(o *options, path string, resolve func(crypt.Info) (t target
 
 // keepTarget is a resolve func for update that re-encrypts the file the way
 // it already is.
-func keepTarget(path string, force bool) func(crypt.Info) (target, bool, error) {
+func (o *options) keepTarget(path string, force bool) func(crypt.Info) (target, bool, error) {
 	return func(info crypt.Info) (target, bool, error) {
-		t, err := sameTarget(path, info)
+		t, err := o.sameTarget(path, info)
 		return t, force, err
 	}
 }

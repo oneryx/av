@@ -29,7 +29,7 @@ func (c *CLI) printCmd() *cobra.Command {
 		Short: "Print the decrypted content",
 		Args:  noArgs,
 		RunE: func(*cobra.Command, []string) error {
-			plain, _, _, err := o.decrypt(EncPath(o.file))
+			plain, _, _, err := o.decrypt(editPath(o.file))
 			if err != nil {
 				return err
 			}
