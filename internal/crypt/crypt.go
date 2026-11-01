@@ -14,64 +14,35 @@ import (
 	"filippo.io/age/armor"
 )
 
-// Info describes how a file was encrypted, so it can be re-encrypted the same
-// way after editing.
-type Info struct {
-	// Passphrase is set when the file was encrypted with a passphrase (scrypt).
-	Passphrase string
-}
-
-// IsPassphrase reports whether the file was encrypted with a passphrase.
-func (i Info) IsPassphrase() bool { return i.Passphrase != "" }
-
 // ErrNoIdentity is returned when a recipient-encrypted file is decrypted
 // without any identities.
 var ErrNoIdentity = errors.New("no identity found")
 
-// Decrypt decrypts an age file. ASCII-armored files (as written by "age -a")
-// are still read so they can be converted on the next save. If the file is encrypted
-// with a passphrase, prompt is used to obtain it; otherwise identities are
-// loaded lazily through loadIDs.
-func Decrypt(data []byte, loadIDs func() ([]age.Identity, error), prompt SecretPrompt) ([]byte, Info, error) {
-	var info Info
+// Decrypt decrypts an age file with the identities returned by loadIDs. The
+// identities are loaded only when needed. ASCII-armored files (as written by
+// "age -a") are still read so they can be converted on the next save.
+func Decrypt(data []byte, loadIDs func() ([]age.Identity, error)) ([]byte, error) {
 	var r io.Reader = bytes.NewReader(data)
 	if trimmed := bytes.TrimSpace(data); bytes.HasPrefix(trimmed, []byte(armor.Header)) {
 		r = armor.NewReader(bytes.NewReader(trimmed))
 	}
 	br := bufio.NewReader(r)
-
 	if isScrypt(br) {
-		pass, err := prompt("Enter passphrase:")
-		if err != nil {
-			return nil, info, fmt.Errorf("could not read passphrase: %w", err)
-		}
-		id, err := age.NewScryptIdentity(string(pass))
-		if err != nil {
-			return nil, info, err
-		}
-		plain, err := decryptAll(br, id)
-		if errors.As(err, new(*age.NoIdentityMatchError)) {
-			return nil, info, errors.New("incorrect passphrase")
-		}
-		if err != nil {
-			return nil, info, err
-		}
-		info.Passphrase = string(pass)
-		return plain, info, nil
+		return nil, errors.New("encrypted with a passphrase, which av does not support")
 	}
 
 	ids, err := loadIDs()
 	if err != nil {
-		return nil, info, err
+		return nil, err
 	}
 	if len(ids) == 0 {
-		return nil, info, ErrNoIdentity
+		return nil, ErrNoIdentity
 	}
 	plain, err := decryptAll(br, ids...)
 	if errors.As(err, new(*age.NoIdentityMatchError)) {
-		return nil, info, errors.New("no identity matched any of the file's recipients")
+		return nil, errors.New("no identity matched any of the file's recipients")
 	}
-	return plain, info, err
+	return plain, err
 }
 
 func decryptAll(r io.Reader, ids ...age.Identity) ([]byte, error) {
@@ -111,15 +82,6 @@ func Encrypt(plain []byte, recipients []age.Recipient) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-// PassphraseRecipient returns a scrypt recipient for passphrase.
-func PassphraseRecipient(passphrase string) ([]age.Recipient, error) {
-	r, err := age.NewScryptRecipient(passphrase)
-	if err != nil {
-		return nil, err
-	}
-	return []age.Recipient{r}, nil
 }
 
 // WriteFileAtomic writes data to name via a temporary file and rename. If name

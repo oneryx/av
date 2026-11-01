@@ -35,16 +35,6 @@ type Editor struct {
 	Name string
 }
 
-// DefaultCommand returns the user's preferred editor.
-func DefaultCommand() string {
-	for _, v := range []string{"VISUAL", "EDITOR"} {
-		if e := strings.TrimSpace(os.Getenv(v)); e != "" {
-			return e
-		}
-	}
-	return "vi"
-}
-
 // Edit opens initial in the editor and returns the edited content once it
 // passes validate. changed is false if the content was not modified.
 func (e *Editor) Edit(initial []byte, validate func([]byte) error) (content []byte, changed bool, err error) {
@@ -182,4 +172,15 @@ func tempBase() string {
 
 func indent(s string) string {
 	return "  " + strings.ReplaceAll(s, "\n", "\n  ")
+}
+
+// DefaultCommand returns the user's preferred editor: $VISUAL, then $EDITOR,
+// then vi.
+func DefaultCommand() string {
+	for _, v := range []string{"VISUAL", "EDITOR"} {
+		if e := strings.TrimSpace(os.Getenv(v)); e != "" {
+			return e
+		}
+	}
+	return "vi"
 }

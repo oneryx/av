@@ -20,6 +20,8 @@ type CLI struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+	// Editor is the command line that edits files (run via sh -c). Empty means vi.
+	Editor string
 
 	in *bufio.Reader
 }
@@ -67,19 +69,15 @@ func (c *CLI) Run(args []string) int {
 const rootLong = `av (age-env) keeps .env files encrypted with age.
 
 Identities:
-    Without -i, av uses $AV_IDENTITY_DATA (the content of an identity file,
-    handy in CI) and $AV_IDENTITY (identity file paths separated by ":") if
-    set, otherwise any of ~/.config/age/keys.txt,
+    Without -i, av uses whichever of ~/.config/age/keys.txt,
     ~/Library/Application Support/age/keys.txt (macOS), ~/.ssh/id_ed25519 and
-    ~/.ssh/id_rsa that exist.
+    ~/.ssh/id_rsa exist.
 
 Recipients:
-    Recipients are kept in one file, recipients.txt (public keys only, safe to
-    commit). The file is --recipients-path, else $AV_RECIPIENTS, else
-    recipients.txt in the current directory, else next to keys.txt. av new
-    creates ./recipients.txt if none exists. Every save prints who it is
-    encrypted to. Passphrase-encrypted files keep their passphrase on edit.
-    Show the file with: av recipients print
+    Files are encrypted to the public keys in recipients.txt, looked up in the
+    current directory, then ~/.config/age (safe to commit), or to
+    your own key if there is none. Edit it with av recipients edit.
+    Every save prints who the file is encrypted to.
 
 Using the variables:
     av run -- npm start           # only the command sees the variables
@@ -91,14 +89,14 @@ Using the variables:
 Shell completion:
     source <(av completion zsh)   # see "av completion --help"`
 
-const rootExample = `  av new                                   # open $EDITOR, encrypt to your own key
-  av new --from .env -r age1... -r age1... # encrypt an existing .env to two recipients
-  av new -f prod -R team.txt               # prod.env.age for the keys in team.txt
+const rootExample = `  av encrypt .env                          # .env.age, encrypted to your own key
+  av encrypt .env -r age1... -r age1...    # .env.age for two recipients
+  av encrypt prod.env -R team.txt         # prod.env.age for the keys in team.txt
   av edit
   av set DEBUG=1 API_KEY                   # API_KEY is read without echo
-  av recipients add "ssh-ed25519 AAAA... alice"
-  av print -i ~/.ssh/id_ed25519
-  av run -f prod -- ./deploy.sh`
+  av recipients edit                       # add or remove keys in recipients.txt
+  av get -i ~/.ssh/id_ed25519
+  av run prod.env.age -- ./deploy.sh`
 
 func (c *CLI) rootCmd() *cobra.Command {
 	cobra.EnableCommandSorting = false
@@ -140,9 +138,9 @@ func (c *CLI) rootCmd() *cobra.Command {
 			root.AddCommand(cmd)
 		}
 	}
-	add("edit", c.newCmd(), c.editCmd(), c.setCmd(), c.unsetCmd())
-	add("use", c.printCmd(), c.getCmd(), c.exportCmd(), c.runCmd())
-	add("access", c.recipientsCmd(), c.rekeyCmd())
+	add("edit", c.encryptCmd(), c.editCmd(), c.setCmd(), c.unsetCmd())
+	add("use", c.getCmd(), c.exportCmd(), c.runCmd())
+	add("access", c.recipientsCmd())
 	root.AddCommand(c.versionCmd())
 	return root
 }

@@ -18,8 +18,6 @@ import (
 
 const plain = "KEY1=VALUE1\nKEY2=VALUE2\n"
 
-func noPrompt(string) ([]byte, error) { return nil, errors.New("unexpected prompt") }
-
 func ids(list ...age.Identity) func() ([]age.Identity, error) {
 	return func() ([]age.Identity, error) { return list, nil }
 }
@@ -33,20 +31,19 @@ func writeFile(t *testing.T, name, content string) string {
 	return p
 }
 
-func roundTrip(t *testing.T, recs []age.Recipient, load func() ([]age.Identity, error), prompt SecretPrompt) Info {
+func roundTrip(t *testing.T, recs []age.Recipient, load func() ([]age.Identity, error)) {
 	t.Helper()
 	enc, err := Encrypt([]byte(plain), recs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, info, err := Decrypt(enc, load, prompt)
+	got, err := Decrypt(enc, load)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != plain {
 		t.Fatalf("got %q", got)
 	}
-	return info
 }
 
 func TestX25519MultipleRecipients(t *testing.T) {
@@ -56,31 +53,31 @@ func TestX25519MultipleRecipients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip(t, recs, ids(a), noPrompt)
-	roundTrip(t, recs, ids(b), noPrompt)
+	roundTrip(t, recs, ids(a))
+	roundTrip(t, recs, ids(b))
 	other, _ := age.GenerateX25519Identity()
 	enc, _ := Encrypt([]byte(plain), recs)
-	if _, _, err := Decrypt(enc, ids(other), noPrompt); err == nil {
+	if _, err := Decrypt(enc, ids(other)); err == nil {
 		t.Fatal("decrypted with wrong identity")
 	}
-	if _, _, err := Decrypt(enc, ids(), noPrompt); !errors.Is(err, ErrNoIdentity) {
+	if _, err := Decrypt(enc, ids()); !errors.Is(err, ErrNoIdentity) {
 		t.Fatalf("err = %v, want ErrNoIdentity", err)
 	}
 }
 
-func TestPassphrase(t *testing.T) {
-	recs, err := PassphraseRecipient("hunter2")
+// Passphrase-encrypted files are rejected before any identity is loaded.
+func TestPassphraseFileRejected(t *testing.T) {
+	r, err := age.NewScryptRecipient("hunter2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt := func(string) ([]byte, error) { return []byte("hunter2"), nil }
-	noIDs := func() ([]age.Identity, error) { t.Fatal("identities loaded for scrypt file"); return nil, nil }
-	if info := roundTrip(t, recs, noIDs, prompt); info.Passphrase != "hunter2" {
-		t.Fatalf("info.Passphrase = %q", info.Passphrase)
+	r.SetWorkFactor(10)
+	enc, err := Encrypt([]byte(plain), []age.Recipient{r})
+	if err != nil {
+		t.Fatal(err)
 	}
-	enc, _ := Encrypt([]byte(plain), recs)
-	wrong := func(string) ([]byte, error) { return []byte("nope"), nil }
-	if _, _, err := Decrypt(enc, noIDs, wrong); err == nil || !strings.Contains(err.Error(), "incorrect passphrase") {
+	noIDs := func() ([]age.Identity, error) { t.Fatal("identities loaded for scrypt file"); return nil, nil }
+	if _, err := Decrypt(enc, noIDs); err == nil || !strings.Contains(err.Error(), "passphrase") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -91,7 +88,7 @@ func TestIdentityFileAndRecipientsFile(t *testing.T) {
 	idFile := writeFile(t, "keys.txt", "# created: now\n# public key: "+a.Recipient().String()+"\n"+a.String()+"\n")
 	recFile := writeFile(t, "recipients.txt", "# team\n\n"+a.Recipient().String()+"\n"+b.Recipient().String()+"\n")
 
-	loaded, err := LoadIdentityFile(idFile, noPrompt)
+	loaded, err := LoadIdentityFile(idFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,9 +100,9 @@ func TestIdentityFileAndRecipientsFile(t *testing.T) {
 		t.Fatalf("lines = %v, err = %v", lines, err)
 	}
 	recs, _ := ParseRecipients(lines)
-	roundTrip(t, recs, ids(AgeIdentities(loaded)...), noPrompt)
+	roundTrip(t, recs, ids(AgeIdentities(loaded)...))
 
-	fromData, err := ParseIdentityData("AV_IDENTITY_DATA", []byte(a.String()), noPrompt)
+	fromData, err := ParseIdentityData("identity data", []byte(a.String()))
 	if err != nil || len(fromData) != 1 || fromData[0].Recipient != a.Recipient().String() {
 		t.Fatalf("ParseIdentityData = %+v, %v", fromData, err)
 	}
@@ -125,7 +122,7 @@ func TestSSHEd25519(t *testing.T) {
 	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub)))
 	keyFile := writeFile(t, "id_ed25519", string(pem.EncodeToMemory(block)))
 
-	loaded, err := LoadIdentityFile(keyFile, noPrompt)
+	loaded, err := LoadIdentityFile(keyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,35 +133,25 @@ func TestSSHEd25519(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip(t, recs, ids(AgeIdentities(loaded)...), noPrompt)
+	roundTrip(t, recs, ids(AgeIdentities(loaded)...))
 
-	// The same key given as data, e.g. from AV_IDENTITY_DATA.
-	fromData, err := ParseIdentityData("AV_IDENTITY_DATA", pem.EncodeToMemory(block), noPrompt)
+	// The same key given as data, e.g. from a secret manager.
+	fromData, err := ParseIdentityData("identity data", pem.EncodeToMemory(block))
 	if err != nil || len(fromData) != 1 || fromData[0].Recipient != pubLine {
 		t.Fatalf("ParseIdentityData = %+v, %v", fromData, err)
 	}
 }
 
-func TestEncryptedSSHKey(t *testing.T) {
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+// Passphrase-protected SSH keys are rejected.
+func TestEncryptedSSHKeyRejected(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	block, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "test", []byte("sshpass"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	keyFile := writeFile(t, "id_ed25519", string(pem.EncodeToMemory(block)))
-	sshPub, _ := ssh.NewPublicKey(pub)
-	os.WriteFile(keyFile+".pub", ssh.MarshalAuthorizedKey(sshPub), 0o644)
-
-	prompted := 0
-	prompt := func(string) ([]byte, error) { prompted++; return []byte("sshpass"), nil }
-	loaded, err := LoadIdentityFile(keyFile, prompt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	recs, _ := ParseRecipients([]string{loaded[0].Recipient})
-	roundTrip(t, recs, ids(AgeIdentities(loaded)...), noPrompt)
-	if prompted != 1 {
-		t.Fatalf("prompted %d times", prompted)
+	if _, err := LoadIdentityFile(keyFile); err == nil || !strings.Contains(err.Error(), "passphrase") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -185,7 +172,7 @@ func TestDecryptArmored(t *testing.T) {
 	w.Write([]byte(plain))
 	w.Close()
 	aw.Close()
-	got, _, err := Decrypt(buf.Bytes(), ids(a), noPrompt)
+	got, err := Decrypt(buf.Bytes(), ids(a))
 	if err != nil || string(got) != plain {
 		t.Fatalf("got %q, %v", got, err)
 	}

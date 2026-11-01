@@ -3,15 +3,20 @@ package cli
 import (
 	"github.com/oneryx/av/internal/crypt"
 	"github.com/oneryx/av/internal/identity"
-	"github.com/oneryx/av/internal/tty"
 )
 
-const noIdentityHint = "no identity found: pass -i, set " + identity.FilesEnv + " or " + identity.DataEnv + ", or create ~/.config/age/keys.txt"
+const noIdentityHint = "no identity found: pass -i, or create ~/.config/age/keys.txt"
 
-func readPrompt(prompt string) ([]byte, error) { return tty.ReadSecret(prompt) }
-
-// loadIdentities loads identities from -i, else from $AV_IDENTITY_DATA and
-// $AV_IDENTITY, else from the default locations (see identity.Load).
+// loadIdentities loads identities from -i, else from the default locations.
+// The result is cached, so the identity files are read once per command.
 func (o *options) loadIdentities() ([]crypt.Identity, error) {
-	return identity.Load(o.identities, nil, readPrompt)
+	if o.idsLoaded {
+		return o.ids, nil
+	}
+	ids, err := identity.Load(o.identities, nil)
+	if err != nil {
+		return nil, err
+	}
+	o.ids, o.idsLoaded = ids, true
+	return ids, nil
 }

@@ -24,9 +24,6 @@ func setup(t *testing.T) (*age.X25519Identity, string) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	t.Setenv("HOME", dir)
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("AV_IDENTITY", "")
-	t.Setenv("AV_IDENTITY_DATA", "")
 	key, err := age.GenerateX25519Identity()
 	must(t, err)
 	keyFile := filepath.Join(dir, "key.txt")
@@ -75,20 +72,6 @@ func TestReadIdentitySources(t *testing.T) {
 		got, err := Read("x.env.age", WithIdentityData([]byte(key.String())))
 		check(t, got, err)
 	})
-	t.Run("AV_IDENTITY", func(t *testing.T) {
-		key, keyFile := setup(t)
-		encrypt(t, DefaultPath, content, key.Recipient())
-		t.Setenv("AV_IDENTITY", keyFile)
-		got, err := Read("")
-		check(t, got, err)
-	})
-	t.Run("AV_IDENTITY_DATA", func(t *testing.T) {
-		key, _ := setup(t)
-		encrypt(t, DefaultPath, content, key.Recipient())
-		t.Setenv("AV_IDENTITY_DATA", key.String())
-		got, err := Read("")
-		check(t, got, err)
-	})
 	t.Run("default key location", func(t *testing.T) {
 		key, _ := setup(t)
 		encrypt(t, DefaultPath, content, key.Recipient())
@@ -96,13 +79,6 @@ func TestReadIdentitySources(t *testing.T) {
 		must(t, os.MkdirAll(filepath.Join(home, ".config", "age"), 0o700))
 		must(t, os.WriteFile(filepath.Join(home, ".config", "age", "keys.txt"), []byte(key.String()), 0o600))
 		got, err := Read("")
-		check(t, got, err)
-	})
-	t.Run("options take precedence over env", func(t *testing.T) {
-		key, keyFile := setup(t)
-		encrypt(t, DefaultPath, content, key.Recipient())
-		t.Setenv("AV_IDENTITY", "/does/not/exist")
-		got, err := Read("", WithIdentityFiles(keyFile))
 		check(t, got, err)
 	})
 }
@@ -159,34 +135,6 @@ func TestReadErrors(t *testing.T) {
 	})
 }
 
-func TestReadPassphrase(t *testing.T) {
-	setup(t)
-	r, err := age.NewScryptRecipient("secret")
-	must(t, err)
-	r.SetWorkFactor(10)
-	encrypt(t, DefaultPath, content, r)
-
-	if _, err := Read(""); !errors.Is(err, ErrPassphraseRequired) {
-		t.Fatalf("no passphrase: got %v, want ErrPassphraseRequired", err)
-	}
-	got, err := Read("", WithPassphrase("secret"))
-	check(t, got, err)
-
-	var asked string
-	got, err = Read("", WithPrompt(func(p string) ([]byte, error) {
-		asked = p
-		return []byte("secret"), nil
-	}))
-	check(t, got, err)
-	if asked == "" {
-		t.Error("prompt was not called")
-	}
-
-	if _, err := Read("", WithPassphrase("wrong")); err == nil || !strings.Contains(err.Error(), "incorrect passphrase") {
-		t.Fatalf("wrong passphrase: got %v", err)
-	}
-}
-
 func TestLoad(t *testing.T) {
 	key, keyFile := setup(t)
 	encrypt(t, DefaultPath, content, key.Recipient())
@@ -205,5 +153,33 @@ func TestLoad(t *testing.T) {
 	}
 	if got, ok := os.LookupEnv("EMPTY"); !ok || got != "" {
 		t.Errorf("EMPTY = %q, %v; want set to empty", got, ok)
+	}
+}
+
+func TestDecryptTextAndReadRejectsIt(t *testing.T) {
+	key, _ := setup(t)
+	const text = "-----BEGIN KEY-----\nnot KEY=VALUE\n"
+	encrypt(t, "secrets.age", text, key.Recipient())
+
+	got, err := Decrypt("secrets.age", WithIdentityData([]byte(key.String())))
+	if err != nil || string(got) != text {
+		t.Fatalf("Decrypt = %q, %v", got, err)
+	}
+	if _, err := Read("secrets.age", WithIdentityData([]byte(key.String()))); err == nil || !strings.Contains(err.Error(), "not a .env.age file") {
+		t.Fatalf("Read on text file: %v", err)
+	}
+	if _, err := Decrypt("missing.age"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Decrypt missing: %v", err)
+	}
+}
+
+func TestPassphraseFilesRejected(t *testing.T) {
+	setup(t)
+	r, err := age.NewScryptRecipient("secret")
+	must(t, err)
+	r.SetWorkFactor(10)
+	encrypt(t, DefaultPath, content, r)
+	if _, err := Read(""); err == nil || !strings.Contains(err.Error(), "passphrase") {
+		t.Fatalf("passphrase file: got %v", err)
 	}
 }

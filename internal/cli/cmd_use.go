@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/oneryx/av/internal/dotenv"
@@ -14,40 +15,38 @@ import (
 
 // Commands that read a file without changing it.
 
-// readCmd builds a command with just -f and -i.
+// readCmd adds -i to a command that reads a file.
 func readCmd(o *options, cmd *cobra.Command) *cobra.Command {
-	addFileFlag(cmd.Flags(), o)
 	addIdentityFlag(cmd.Flags(), o)
-	registerCompletions(cmd)
 	return cmd
-}
-
-func (c *CLI) printCmd() *cobra.Command {
-	var o options
-	return readCmd(&o, &cobra.Command{
-		Use:   "print",
-		Short: "Print the decrypted content",
-		Args:  noArgs,
-		RunE: func(*cobra.Command, []string) error {
-			plain, _, _, err := o.decrypt(editPath(o.file))
-			if err != nil {
-				return err
-			}
-			_, err = c.Stdout.Write(plain)
-			return err
-		},
-	})
 }
 
 func (c *CLI) getCmd() *cobra.Command {
 	var o options
 	return readCmd(&o, &cobra.Command{
-		Use:   "get KEY",
-		Short: "Print the value of one variable",
-		Long:  "Print the value of KEY. Fails if KEY is not set.",
-		Args:  exactArgs(1, "exactly one KEY"),
+		Use:   "get [KEY] [FILE.age]",
+		Short: "Print the decrypted content, or the value of one variable",
+		Long: `Without KEY, print the decrypted content of the file. With KEY, print its
+value; it fails if KEY is not set.
+
+The file is the last argument if it ends in ".age" (keys never contain dots).`,
+		Args: withFile(false, func(_ *cobra.Command, rest []string) error {
+			if len(rest) > 1 {
+				return usagef("expected at most one KEY")
+			}
+			return nil
+		}),
 		RunE: func(_ *cobra.Command, args []string) error {
-			entries, err := o.entries()
+			args = o.takeFile(args, false)
+			if len(args) == 0 {
+				plain, _, err := o.decrypt(EncPath(o.file))
+				if err != nil {
+					return err
+				}
+				_, err = c.Stdout.Write(plain)
+				return err
+			}
+			entries, err := o.entries("get")
 			if err != nil {
 				return err
 			}
@@ -65,7 +64,7 @@ func (c *CLI) getCmd() *cobra.Command {
 func (c *CLI) exportCmd() *cobra.Command {
 	var o options
 	return readCmd(&o, &cobra.Command{
-		Use:   "export",
+		Use:   "export [FILE]",
 		Short: "Print shell export statements (use with eval)",
 		Long: `Print "export KEY='VALUE'" lines for every variable. A program cannot change
 its parent shell's environment, so evaluate the output:
@@ -74,9 +73,11 @@ its parent shell's environment, so evaluate the output:
 
 or install the shell function shown in "av help". Prefer "av run" when you
 only need the variables for one command.`,
-		Args: noArgs,
-		RunE: func(*cobra.Command, []string) error {
-			entries, err := o.entries()
+		Args:              withFile(true, noArgs),
+		ValidArgsFunction: completeFile,
+		RunE: func(_ *cobra.Command, args []string) error {
+			o.takeFile(args, true)
+			entries, err := o.entries("export")
 			if err != nil {
 				return err
 			}
@@ -89,17 +90,27 @@ only need the variables for one command.`,
 func (c *CLI) runCmd() *cobra.Command {
 	var o options
 	cmd := readCmd(&o, &cobra.Command{
-		Use:   "run [flags] [--] COMMAND [ARGS...]",
+		Use:   "run [FILE.age] [--] COMMAND [ARGS...]",
 		Short: "Run a command with the variables in its environment",
 		Long: `Run COMMAND with the variables added to its environment, without exporting
 them into your shell. Variables in the file override inherited ones. av exits
 with COMMAND's exit status.
 
-av's own flags must come before COMMAND; everything after it is passed on.`,
-		Example: "  av run -- npm start\n  av run -f prod ./deploy.sh --dry-run",
+The file, if given, comes first and must end in ".age". av's own flags must
+come before COMMAND; everything after it is passed on.`,
+		Example: "  av run -- npm start\n  av run prod.env.age ./deploy.sh --dry-run",
 		Args:    minArgs(1, "a COMMAND to run"),
 		RunE: func(_ *cobra.Command, argv []string) error {
-			entries, err := o.entries()
+			if len(argv) > 1 && strings.HasSuffix(argv[0], ".age") {
+				o.file, argv = argv[0], argv[1:]
+				if argv[0] == "--" {
+					argv = argv[1:]
+				}
+			}
+			if len(argv) == 0 {
+				return usagef("expected a COMMAND to run")
+			}
+			entries, err := o.entries("run")
 			if err != nil {
 				return err
 			}

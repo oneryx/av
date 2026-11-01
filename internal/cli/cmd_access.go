@@ -1,10 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"path/filepath"
 
 	"github.com/oneryx/av/internal/crypt"
 	"github.com/spf13/cobra"
@@ -12,182 +13,122 @@ import (
 
 // Commands that change who can decrypt a file.
 
+// recipientsTemplate starts a new recipients file.
+const recipientsTemplate = `# Public keys that av encrypts files to, one per line. Safe to commit.
+# Example: av recipients edit, then add a line such as age1... or ssh-ed25519 AAAA... alice
+`
+
 func (c *CLI) recipientsCmd() *cobra.Command {
-	var o options
-	list := func(*cobra.Command, []string) error {
-		lines, _, err := o.readRecipients()
-		if err != nil {
-			return err
-		}
-		for _, l := range lines {
-			fmt.Fprintln(c.Stdout, l)
-		}
-		return nil
-	}
 	cmd := &cobra.Command{
 		Use:   "recipients",
-		Short: "List, print, add or remove recipients",
-		Long: `List the recipients in the recipients file (the default), or add or remove
-some and re-encrypt the file. print shows the file's path and content.
+		Short: "Get or edit the recipients file",
+		Long: `The recipients file lists the public keys that files are encrypted to when
+no -r or -R is given. Without FILE, it is recipients.txt in the current
+directory, or else in ~/.config/age/.
 
-add and rm re-encrypt only the file given with -f. Other files that use the
-recipients file need av rekey.
-
+"edit" does not re-encrypt any file: run "av edit" and save on each file afterwards.
 Removed recipients can still read old copies of the file (e.g. in git
 history), so rotate the secrets they had access to.`,
-		Args: func(cmd *cobra.Command, args []string) error {
+		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				return usagef("unknown action %q", args[0])
 			}
 			return nil
 		},
-		RunE: list,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			fmt.Fprint(c.Stderr, cmd.UsageString())
+			return exitCode(2)
+		},
 	}
-	addFileFlag(cmd.PersistentFlags(), &o)
-	addIdentityFlag(cmd.PersistentFlags(), &o)
-	addRecipientsPathFlag(cmd.PersistentFlags(), &o)
-	registerCompletions(cmd)
-
 	cmd.AddCommand(&cobra.Command{
-		Use:   "list",
-		Short: "List the recipients",
-		Args:  noArgs,
-		RunE:  list,
-	}, &cobra.Command{
-		Use:   "print",
-		Short: "Print the path and content of the recipients file",
-		Args:  noArgs,
-		RunE: func(*cobra.Command, []string) error {
-			path, err := o.existingRecipientsFile()
+		Use:               "get [FILE]",
+		Short:             "Print the recipients",
+		Args:              atMostOneFile,
+		ValidArgsFunction: completeFile,
+		RunE: func(_ *cobra.Command, args []string) error {
+			path, found, err := recipientsPath(args)
 			if err != nil {
 				return err
 			}
-			data, err := os.ReadFile(path)
+			if !found {
+				return fmt.Errorf("%s not found: create it with `av recipients edit`", path)
+			}
+			lines, err := crypt.ReadRecipientsFile(path)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(c.Stdout, path)
-			_, err = c.Stdout.Write(data)
-			return err
+			for _, l := range lines {
+				fmt.Fprintln(c.Stdout, l)
+			}
+			return nil
 		},
 	}, &cobra.Command{
-		Use:     "add RECIPIENT...",
-		Short:   "Add recipients and re-encrypt",
-		Example: `  av recipients add age1... "ssh-ed25519 AAAA... alice"`,
-		Args:    minArgs(1, "at least one RECIPIENT"),
+		Use:   "edit [FILE]",
+		Short: "Edit the recipients file in $EDITOR",
+		Long: `Open the recipients file in $VISUAL/$EDITOR and save it when you quit. Every
+non-comment line must be a valid recipient, and there must be at least one.
+Nothing is re-encrypted; run "av edit" and save on the files that should change.`,
+		Args:              atMostOneFile,
+		ValidArgsFunction: completeFile,
 		RunE: func(_ *cobra.Command, args []string) error {
-			return c.changeRecipients(&o, func(lines []string) ([]string, error) {
-				for _, r := range args {
-					if _, err := crypt.ParseRecipient(r); err != nil {
-						return nil, fmt.Errorf("invalid recipient %q: %v", r, err)
-					}
+			path, found, err := recipientsPath(args)
+			if err != nil {
+				return err
+			}
+			initial := []byte(recipientsTemplate)
+			if found {
+				if initial, err = os.ReadFile(path); err != nil {
+					return err
 				}
-				return dedupe(append(append([]string{}, lines...), args...)), nil
-			})
-		},
-	}, &cobra.Command{
-		Use:   "rm RECIPIENT...",
-		Short: "Remove recipients and re-encrypt",
-		Long: `Remove recipients and re-encrypt. A RECIPIENT may be the full line, an SSH
-key without its comment, or just the SSH comment (e.g. "alice").`,
-		Args: minArgs(1, "at least one RECIPIENT"),
-		ValidArgsFunction: func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-			lines, _, _ := o.readRecipients()
-			return recipientNames(lines), cobra.ShellCompDirectiveNoFileComp
-		},
-		RunE: func(_ *cobra.Command, args []string) error {
-			if err := c.changeRecipients(&o, func(lines []string) ([]string, error) {
-				return removeRecipients(lines, args, EncPath(o.file))
-			}); err != nil {
+			}
+			content, changed, err := c.editor(path).Edit(initial, validateRecipients)
+			if err != nil {
 				return err
 			}
-			fmt.Fprintln(c.Stderr, "Removed recipients can still read old copies (e.g. in git history); rotate the secrets they had access to.")
+			if !changed {
+				fmt.Fprintln(c.Stderr, "No changes made; nothing written.")
+				return nil
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			if err := crypt.WriteFileAtomic(path, content, 0o644); err != nil {
+				return err
+			}
+			fmt.Fprintf(c.Stderr, "Wrote %s. Files are not re-encrypted: run av edit and save on them.\n", path)
 			return nil
 		},
 	})
 	return cmd
 }
 
-// changeRecipients rewrites the recipients file with edit's result and
-// re-encrypts the file for it.
-func (c *CLI) changeRecipients(o *options, edit func([]string) ([]string, error)) error {
-	path := EncPath(o.file)
-	lines, rp, err := o.readRecipients()
+// atMostOneFile accepts an optional recipients FILE.
+func atMostOneFile(_ *cobra.Command, args []string) error {
+	if len(args) > 1 {
+		return usagef("expected at most one FILE")
+	}
+	return nil
+}
+
+// recipientsPath returns the recipients file named by args, or the default
+// one. found is false if the file does not exist.
+func recipientsPath(args []string) (path string, found bool, err error) {
+	if len(args) == 1 {
+		return args[0], fileExists(args[0]), nil
+	}
+	return findRecipients()
+}
+
+// validateRecipients checks that content has at least one recipient and that
+// every recipient line is valid.
+func validateRecipients(content []byte) error {
+	lines, err := crypt.ReadRecipients(recipientsFileName, bytes.NewReader(content))
 	if err != nil {
 		return err
 	}
-	updated, err := edit(lines)
-	if err != nil {
-		return err
+	if len(lines) == 0 {
+		return errors.New("no recipients: add at least one public key")
 	}
-	if strings.Join(updated, "\n") == strings.Join(lines, "\n") {
-		fmt.Fprintln(c.Stderr, "Recipients unchanged; nothing written.")
-		return nil
-	}
-	resolve := func(crypt.Info) (target, bool, error) {
-		t, err := recipientsTarget(updated, rp)
-		return t, true, err
-	}
-	return c.update(o, path, resolve, unchanged)
-}
-
-func removeRecipients(lines, args []string, path string) ([]string, error) {
-	drop := map[string]bool{}
-	for _, arg := range args {
-		var matches []string
-		for _, l := range lines {
-			if matchRecipient(l, arg) {
-				matches = append(matches, l)
-			}
-		}
-		switch len(matches) {
-		case 0:
-			return nil, fmt.Errorf("%q is not a recipient of %s", arg, path)
-		case 1:
-			drop[matches[0]] = true
-		default:
-			return nil, fmt.Errorf("%q matches %d recipients; use the full key", arg, len(matches))
-		}
-	}
-	var out []string
-	for _, l := range lines {
-		if !drop[l] {
-			out = append(out, l)
-		}
-	}
-	if len(out) == 0 {
-		return nil, errors.New("can't remove every recipient")
-	}
-	return out, nil
-}
-
-// recipientNames returns the short names "rm" accepts, for completion: the
-// SSH comment if there is one, otherwise the whole recipient.
-func recipientNames(lines []string) []string {
-	var names []string
-	for _, l := range lines {
-		if f := strings.Fields(l); len(f) >= 3 {
-			names = append(names, strings.Join(f[2:], " "))
-		} else {
-			names = append(names, l)
-		}
-	}
-	return names
-}
-
-func (c *CLI) rekeyCmd() *cobra.Command {
-	var o options
-	cmd := readCmd(&o, &cobra.Command{
-		Use:   "rekey",
-		Short: "Re-encrypt a file for its current recipients",
-		Long: `Re-encrypt the file for the recipients in the recipients file (or with its
-passphrase), e.g. after pulling a recipients file a teammate changed.`,
-		Args: noArgs,
-		RunE: func(*cobra.Command, []string) error {
-			path := EncPath(o.file)
-			return c.update(&o, path, o.keepTarget(path, true), unchanged)
-		},
-	})
-	addRecipientsPathFlag(cmd.Flags(), &o)
-	return cmd
+	_, err = crypt.ParseRecipients(lines)
+	return err
 }

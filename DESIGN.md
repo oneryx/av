@@ -1,9 +1,7 @@
 # av design
 
 `av` keeps `.env` files encrypted with [age](https://age-encryption.org) so they
-can be committed, and lets you edit, read and use them from the terminal. `edit`
-and `print` also work on any other `*.age` file (saved without the `KEY=VALUE`
-check). This
+can be committed, and lets you edit, read and use them from the terminal. This
 document is a map of the code: what lives where, how the pieces fit together
 and which rules must not be broken. Read it before changing anything; it should
 tell you which file to open.
@@ -14,11 +12,11 @@ tell you which file to open.
 av.go               public library (package av): Read/Load an encrypted .env for other Go programs
 cmd/av/main.go          entry point: works out the version, calls cli.Main
 internal/cli            commands, flags, identity and recipient policy  (depends on all below)
-internal/identity       which identities to use: explicit, $AV_IDENTITY*, default paths
+internal/identity       which identities to use: explicit, default paths
 internal/crypt          thin wrapper around filippo.io/age: encrypt, decrypt, keys, atomic writes
 internal/dotenv         parse, validate, edit and shell-quote .env content
 internal/editor         run $EDITOR on a private temp file, loop until content is valid
-internal/tty            prompts on /dev/tty (secrets, new passphrase)
+internal/tty            hidden input on /dev/tty (values for `set KEY`)
 ```
 
 Dependencies point one way: `cli` → `identity`, `crypt`, `dotenv`, `editor`,
@@ -26,18 +24,17 @@ Dependencies point one way: `cli` → `identity`, `crypt`, `dotenv`, `editor`,
 `cli` and `av` don't import each other. The lower packages know nothing
 about the CLI: no flag names, no hints like "pass -i" in their errors. That
 policy belongs in `cli` (see `identities.go`, `noIdentityHint`). The one
-exception is `identity`, which owns the `AV_IDENTITY*` variables so the CLI and
+exception is `identity`, which decides the default key locations so the CLI and
 the library find keys the same way.
 
 ### Library (`av.go`)
 `Read(path, opts...)` → `os.ReadFile` (errors wrapped with `%w`, so missing
 files match `fs.ErrNotExist`) → `crypt.Decrypt` with `identity.Load(files,
-data, prompt)` → `dotenv.Parse` → map. `Load` sets each variable that isn't
-already set. Rules: the library **never prompts** on its own (no `/dev/tty`;
-without `WithPassphrase`/`WithPrompt` it returns `ErrPassphraseRequired`), and
-its errors **never contain line text** from the file, only line numbers and
-reasons, since library errors end up in logs. This is a public, semver'd API:
-keep it small, and keep `crypt`/`dotenv` types out of it.
+data)` → `dotenv.Parse` → map. `Load` sets each variable that isn't
+already set. Rules: the library **never prompts**, and its errors **never
+contain line text** from the file, only line numbers and reasons, since library
+errors end up in logs. This is a public, semver'd API: keep it small, and keep
+`crypt`/`dotenv` types out of it.
 
 Third-party code: `filippo.io/age` (crypto), `golang.org/x/crypto/ssh` (SSH
 keys), `golang.org/x/term` (no-echo input), `spf13/cobra` + `pflag` (CLI).
@@ -46,14 +43,14 @@ keys), `golang.org/x/term` (no-echo input), `spf13/cobra` + `pflag` (CLI).
 
 | File | Contents |
 |---|---|
-| `cli.go` | `CLI` struct (injected streams), `Run` (error → exit code), root command, command groups, `help`/`version` commands, `confirm` prompt |
-| `flags.go` | `options` (every flag of every command), `add*Flag` helpers, flag completion, positional-argument validators, `EncPath` and `editPath` (file names), small helpers |
-| `cmd_edit.go` | `new`, `edit`, `set`, `unset`, plus `readValue` (hidden input for `set KEY`) |
-| `cmd_use.go` | `print`, `get`, `export`, `run` (`runWithEnv`: child process, signal forwarding, exit status) |
-| `cmd_access.go` | `recipients [list\|print\|add\|rm]`, `rekey` |
+| `cli.go` | `CLI` struct (injected streams and editor), `Run` (error → exit code), root command, command groups, `help`/`version` commands, `confirm` prompt |
+| `flags.go` | `options` (every flag of every command), `add*Flag` helpers, file-argument helpers (`fileArg`, `withFile`, `takeFile`), positional-argument validators, `EncPath`, small helpers |
+| `cmd_edit.go` | `encrypt`, `edit`, `set`, `unset`, plus `readValue` (hidden input for `set KEY`) |
+| `cmd_use.go` | `get`, `export`, `run` (`runWithEnv`: child process, signal forwarding, exit status) |
+| `cmd_access.go` | `recipients [get\|edit]` |
 | `update.go` | `update`, the read-modify-write pipeline; `decrypt`; `entries` |
-| `target.go` | `target` (how to encrypt), choosing it (`explicitTarget`, `newTarget`, `sameTarget`), recipients file lookup (`recipientsFile`) and read/write, `save` |
-| `identities.go` | `loadIdentities` (`-i`, else `identity.Load`), the `/dev/tty` prompt, `noIdentityHint` |
+| `target.go` | `target` (who to encrypt to), choosing it (`explicitTarget`, `newTarget`), the recipients file lookup, `save` |
+| `identities.go` | `loadIdentities` (`-i`, else `identity.Load`), `noIdentityHint` |
 | `cli_test.go` | end-to-end tests through `CLI.Run` |
 
 Each command is a method `func (c *CLI) xxxCmd() *cobra.Command` that owns its
@@ -62,114 +59,102 @@ command bodies are split into `runXxx` methods.
 
 ## Core flows
 
-### Reading: `print`, `get`, `export`, `run`
-`options.decrypt(path)` → `crypt.Decrypt`. `print` uses `editPath(-f)` and writes
-the plaintext as is, for any age file. `get`, `export` and `run` use
-`EncPath` and `options.entries()`, which also parses the content with
-`dotenv.Parse` and refuses files with invalid lines.
+### Reading: `get`, `export`, `run`
+`options.decrypt(path)` → `crypt.Decrypt`. For `get`, `export` and `run`,
+`options.entries()` also parses the content with `dotenv.Parse` and refuses
+files with invalid lines.
 
-`crypt.Decrypt` looks at the age header. A passphrase (scrypt) file prompts
-for the passphrase; any other file loads identities **lazily** through a
-callback, so passphrase files never touch key files and key files are only
-read when needed. It returns `crypt.Info`, which carries the passphrase so the
-file can be re-encrypted with it later.
+`crypt.Decrypt` looks at the age header. Passphrase (scrypt) files are refused
+with an error. Any other file loads identities **lazily** through a callback,
+so key files are only read when needed.
 
-### Changing: `edit`, `set`, `unset`, `rekey`, `recipients add|rm`
+### Changing: `edit`, `set`, `unset`
 All of them go through **`CLI.update(o, path, resolve, change)`** in
 `update.go`:
 
 1. decrypt, keeping the original ciphertext bytes;
-2. `resolve(info)` → the `target` to encrypt to, and whether to save even if
-   the content didn't change (recipient changes, rekey);
+2. `resolve()` → the `target` to encrypt to, and whether to save even if
+   the content didn't change (`edit` always saves, so it picks up new recipients);
 3. `change(plain)` → the new content and whether it changed;
-4. if nothing changed and saving isn't forced: print "No changes" and stop;
+4. if nothing changed and saving isn't forced (`set`, `unset`): print "No changes" and stop;
 5. **lost-update check**: re-read the file and, if its bytes differ from
    step 1, ask before overwriting;
 6. `save`.
 
 To add another command that modifies a file, write a `resolve` (usually
-`o.keepTarget(path, force)`) and a `change` func. Don't write your own
+`keepTarget(o)`) and a `change` func. Don't write your own
 decrypt/encrypt sequence.
 
-`edit` validates the saved content with `dotenv.Validate` only for `*.env.age`
-files (`validatorFor`). Other age files are saved as they are. The editor's temp
-file is named after the plaintext (`.env`, `README.md`) so editors pick the
-right syntax.
-
-### Creating: `new`
-`runNew`: refuse if the file exists (unless `--force`) → content from
-`--from` (validated) or the editor → `newTarget` → `save`. There's no
+### Creating: `encrypt`
+`runEncrypt`: refuse if `FILE.age` exists (unless `--force`) → read `FILE`
+(validated if it's an env file) → `newTarget` → `save`. There's no
 lost-update check because there's no previous version.
 
 ### Targets: who a file is encrypted for (`target.go`)
-`target{recipients, lines, writeTo}`. `lines == nil` means a passphrase.
+`target{recipients, lines}`.
 
-* `explicitTarget`: `-p`, or `-r`/`-R` (written to the recipients file).
-  Returns `ok=false` when none of these flags were given.
-* `newTarget` (new files): explicit flags → the recipients file
-  → the public key of the user's first identity.
-* `sameTarget` (existing files): keep the passphrase if the file has one,
-  else use the recipients file; it's an error if that file is missing (age
-  files don't reveal their recipients).
-* `recipientsFile` (the recipients file for every target): `--recipients-path`,
-  else `$AV_RECIPIENTS`, else the first existing `recipients.txt` in the current
-  directory or in the directory of a default `keys.txt`. If none exists, the path
-  is `./recipients.txt`, and a save creates it.
+* `explicitTarget`: `-r`/`-R`, for this command only. Returns `ok=false` when
+  neither flag was given.
+* `newTarget` (new files, and existing files on edit/set/unset):
+  explicit flags → the recipients file (`loadRecipients`) if it exists → the
+  public key of the user's first identity.
+  Age files don't reveal their recipients, so a missing recipients file
+  silently means "your own key"; the save output lists who the file is for.
 
-`save` encrypts, then **writes the recipients file before the encrypted file**
-when the target has `writeTo` set (explicit `-r`/`-R`, or a new file's own key).
-Passphrase saves never touch the recipients file. It then writes the encrypted
-file atomically and **prints the recipients**.
+Only `recipients edit` writes the recipients file. Encryption reads
+it via `findRecipients` (`./recipients.txt`, then `~/.config/age/recipients.txt`).
+`save` writes the encrypted file atomically and **prints the recipients**;
+nothing else is written next to the file.
 
 ### Identities (`internal/identity`)
-`identity.Load(files, data, prompt)`, used by `cli` (files = `-i`) and
-`av` (`WithIdentityFiles`/`WithIdentityData`). Order: explicit
-files/data (strict) → `$AV_IDENTITY_DATA` (key content) + `$AV_IDENTITY`
-(`:`-separated paths), both strict → default paths (XDG/`~/.config/age/keys.txt`,
-macOS Application Support, `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), where
-missing or unreadable files are skipped silently. Files are parsed by
-`crypt.LoadIdentityFile`, which handles age keys, passphrase-encrypted age
-identity files, plain SSH keys and passphrase-protected SSH keys (whose public
-key comes from the key itself or from `<key>.pub`).
+`identity.Load(files, data)`, used by `cli` (files = `-i`) and `av`
+(`WithIdentityFiles`/`WithIdentityData`). Order: explicit files/data (strict) →
+default paths (`~/.config/age/keys.txt`, macOS Application Support,
+`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), where missing or unreadable files are
+skipped silently. Files are parsed by `crypt.LoadIdentityFile`, which handles
+age keys and plain SSH keys. Passphrase-protected age identity files and
+passphrase-protected SSH keys are refused with an error (and skipped in the
+default locations).
 
 ### Editor (`internal/editor`)
 `Editor.Edit(initial, validate)` writes a 0600 file in a private `MkdirTemp`
-directory (`/dev/shm` on Linux), runs `sh -c "$EDITOR \"$@\""` (so
-`EDITOR="code --wait"` works), and loops: if the content is invalid, it asks
-"[r]e-edit or [a]bort?" on `In`. For vim and neovim it appends `vimFlags` (no
-swap, backup, undo or viminfo files); plain `vi` gets them only if
-`vi --version` says it's vim. A signal handler removes the temp directory on
-SIGTERM/SIGHUP (and on SIGINT when the editor isn't running) and exits 130.
+directory (`/dev/shm` on Linux), runs `sh -c "$CMD \"$@\""` (`Editor.Command`,
+default `$VISUAL`/`$EDITOR`/vi; so `code --wait` works), and loops: if the
+content is invalid, it asks "[r]e-edit or [a]bort?" on `In`. For vim and neovim
+it appends `vimFlags` (no swap, backup, undo or viminfo files); plain `vi` gets
+them only if `vi --version` says it's vim. A signal handler removes the temp
+directory on SIGTERM/SIGHUP (and on SIGINT when the editor isn't running) and
+exits 130.
 
 ## File formats
 
 * **`X.env.age`**: a standard age file, binary, no armor. `age -d` can
   decrypt it. Armored files (from `age -a`) are still read and are rewritten
   as binary on the next save. Mode 0600.
-* **`recipients.txt`**: one recipient per line (`age1…`, `ssh-ed25519 …`,
-  `ssh-rsa …`, `age1pq1…`, `age1tag1…`), `#` comments, first line is a
-  "managed by av" header. Public keys only; meant to be committed. Mode 0644.
-  Shared by all files; found via `recipientsFile` (flag, `$AV_RECIPIENTS`,
-  cwd, then the directory of `keys.txt`). Passphrase saves leave it alone.
+* **`recipients.txt`** (`./recipients.txt`, else `~/.config/age/recipients.txt`;
+  shared by all files): one recipient per line (`age1…`, `ssh-ed25519 …`,
+  `ssh-rsa …`, `age1pq1…`, `age1tag1…`), `#` comments. Public keys only; meant
+  to be committed. Mode 0644. Written by `av recipients edit`.
 * **Plaintext** (`dotenv`): `[export ]KEY=VALUE` lines, `#` comments, single
   quotes (literal), double quotes (`\n \t \r \" \\ \$ \``), unquoted values
   with ` #` inline comments, no `$VAR` expansion, duplicate keys rejected.
-  `EncPath` maps a `-f` value onto the `*.env.age` naming. `editPath` (used by
-  `edit` and `print`) keeps an existing `*.age` file as given.
+  `EncPath` keeps any file name ending in `.age` as is (text file unless
+  it ends in `.env.age`) and appends `.env.age` to the rest. Only env files
+  get `dotenv` validation and the KEY=VALUE commands (`requireEnv`).
 
 ## Invariants (don't break these)
 
 1. Plaintext never touches disk except in the editor's private temp
    directory, and that directory is always removed (`defer` plus the signal
    handler).
-2. No invalid `.env` content is ever encrypted (`new`, `edit` and `set`
+2. No invalid `.env` content is ever encrypted (`encrypt`, `edit` and `set`
    validate; `dotenv.Set`/`Unset` refuse invalid input).
 3. Encrypted files are only written by `crypt.WriteFileAtomic` (temp file,
    fsync, rename; symlinks are followed).
 4. Every successful save says who can decrypt the file.
-5. Re-encrypting an existing file keeps its passphrase or recipients unless
-   the user passes `-r`/`-R`/`-p` or uses `recipients add|rm`.
-6. Secret prompts read `/dev/tty`, never stdin or stdout, so
+5. Re-encrypting an existing file uses the recipients it gets now, unless the
+   user passes `-r`/`-R` for that command.
+6. Secret input (`set KEY`) reads `/dev/tty`, never stdin or stdout, so
    `eval "$(av export)"` and pipes keep working.
 7. Lower packages stay free of CLI policy (see Packages).
 
@@ -188,32 +173,32 @@ Cobra's own error and usage printing is silenced (`SilenceErrors`,
 `SilenceUsage`); `Run` does all of it. Unknown commands and help topics are
 usage errors.
 
-Output conventions: data goes to **stdout** (`print`, `get`, `export`,
-`recipients list`); status messages ("Wrote …", warnings) go to **stderr**.
+Output conventions: data goes to **stdout** (`get`, `export`,
+`recipients get`); status messages ("Wrote …", warnings) go to **stderr**.
 
 ## CLI conventions
 
 * Flags may come after arguments, except for `run`
   (`SetInterspersed(false)`), whose arguments belong to the child command.
-* Common flags: `-f/--file`, `-i/--identity` (repeatable), `-r`, `-R`, `-p`.
-  Use the `add*Flag` helpers so names and help text stay identical across
-  commands, then call `registerCompletions(cmd)`.
+* The encrypted file is a trailing positional argument (`fileArg`, `withFile`,
+  `takeFile`), never a flag. Common flags: `-i/--identity` (repeatable), `-r`,
+  `-R`. Use the `add*Flag` helpers so names and help text stay identical across
+  commands.
 * Repeatable flags use `StringArray`, not `StringSlice`: no comma
   splitting, because recipients and paths may contain commas.
 * A backticked word in a flag's help text becomes its placeholder in
-  `--help` (`` "encrypted `FILE`" `` shows as `--file FILE`).
+  `--help`.
 
 ## Testing
 
 * `cli_test.go` runs real commands through `CLI.Run` with injected streams.
-  `setup` creates a temp dir (`t.Chdir`), an age key in `$AV_IDENTITY` and
-  a fake `$EDITOR` script. `editorWrites(...)` queues the content for each
-  editor run, and `editorRunsHook(n, cmd)` runs a shell command during run n
-  (used to simulate a concurrent change).
+  `setup` creates a temp dir (`t.Chdir`) with `HOME` set to it, an age key at
+  `~/.config/age/keys.txt`, and a fake editor passed as `CLI.Editor`.
+  `editorWrites(...)` queues the content for each editor run, and
+  `editorRunsHook(n, cmd)` runs a shell command during run n (used to simulate
+  a concurrent change).
 * `TestInteropWithAgeCLI` checks against the real `age` binary when it's
   installed.
-* The passphrase paths need a terminal, so they're tested at the `crypt`
-  level (prompt callbacks) and via `save` with `passphraseTarget` directly.
 * Run `task lint` (gofmt, vet, staticcheck, govulncheck) and `task test`
   (or `task test:race`).
 
@@ -232,7 +217,7 @@ Output conventions: data goes to **stdout** (`print`, `get`, `export`,
   GoReleaser (`.goreleaser.yaml`): static (`CGO_ENABLED=0`) linux/darwin ×
   amd64/arm64 binaries, version = the tag, `tar.gz` archives plus
   `checksums.txt`, published as a GitHub release. No Windows build: the
-  editor and prompts need `sh` and `/dev/tty`.
+  editor and secret input need `sh` and `/dev/tty`.
 * Try a release locally: `goreleaser release --snapshot --clean`, which
   writes to `dist/` (ignored by git).
 
@@ -244,11 +229,11 @@ Output conventions: data goes to **stdout** (`print`, `get`, `export`,
   README.
 * **New flag shared by several commands:** add a field to `options`, an
   `add*Flag` helper in `flags.go` and, if useful, completion in
-  `registerCompletions`.
+  `completeFile` for file arguments.
 * **New `.env` syntax:** `dotenv.Parse`/`parseValue`, then make sure
   `Quote` still round-trips (`TestQuote`) and `ExportScript` is still safe.
 * **New recipient or key type:** `crypt.ParseRecipient` and
-  `parseIdentityData`/`parseAgeIdentities` (so `newTarget` can derive the
+  `ParseIdentityData`/`parseAgeIdentities` (so `newTarget` can derive the
   public key).
 * **New identity source:** `identity.Load` (affects both the CLI and the
   library), and update `rootLong`, the `av` package doc and the README.

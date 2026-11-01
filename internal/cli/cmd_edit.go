@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/oneryx/av/internal/crypt"
 	"github.com/oneryx/av/internal/dotenv"
 	"github.com/oneryx/av/internal/editor"
 	"github.com/oneryx/av/internal/tty"
@@ -16,98 +15,73 @@ import (
 	"golang.org/x/term"
 )
 
-// Commands that create or change the content of a file.
+// Commands that encrypt a file or change its content.
 
-const newTemplate = `# One KEY=VALUE per line. Lines starting with # are comments.
-# Values may be 'single' or "double" quoted. Example:
-# DATABASE_URL=postgres://user:pass@localhost/db
-`
-
-// editor returns an editor whose temp file is named after the plaintext of
-// path (".env" for .env.age, "README.md" for README.md.age) so editors pick
-// the right syntax.
+// editor returns an editor for the content of path. Env files are edited as
+// ".env" and text files under their own name, so editors pick the right mode.
 func (c *CLI) editor(path string) *editor.Editor {
-	return &editor.Editor{Name: strings.TrimSuffix(filepath.Base(path), ".age"), In: c.input(), Out: c.Stderr}
+	name := ".env"
+	if !isEnvPath(path) {
+		name = filepath.Base(path)
+	}
+	return &editor.Editor{Command: c.Editor, Name: name, In: c.input(), Out: c.Stderr}
 }
 
-// validatorFor checks .env content for .env.age files; any other age file is
-// saved as is.
+// validatorFor returns the check for content saved to path: KEY=VALUE lines
+// for env files, anything for text files.
 func validatorFor(path string) func([]byte) error {
-	if strings.HasSuffix(path, ".env.age") {
+	if isEnvPath(path) {
 		return dotenv.Validate
 	}
 	return func([]byte) error { return nil }
 }
 
-func (c *CLI) newCmd() *cobra.Command {
+func (c *CLI) encryptCmd() *cobra.Command {
 	var o options
 	cmd := &cobra.Command{
-		Use:   "new",
-		Short: "Create a new encrypted .env.age file",
-		Long: `Create an encrypted file. Without --from, $VISUAL/$EDITOR (default vi) is
-opened on a template; the content must be valid KEY=VALUE lines to be saved.
+		Use:   "encrypt FILE",
+		Short: "Encrypt FILE to FILE.age (FILE is left untouched)",
+		Long: `Encrypt FILE to FILE.age next to it. FILE.age is refused if it exists unless
+--force is given. If the result is a .env.age file (e.g. .env or prod.env),
+FILE must be valid KEY=VALUE lines.
 
-Recipients are chosen from -r/-R, then the recipients file (see --recipients-path),
-then the public key of your identity. "-R -" (stdin) only works with --from.`,
-		Args: noArgs,
-		RunE: func(*cobra.Command, []string) error { return c.runNew(&o) },
+Recipients are chosen from -r/-R, then recipients.txt if it exists, then
+the public key of your identity.`,
+		Example: "  av encrypt secrets.pem          # secrets.pem.age\n  av encrypt .env                 # .env.age\n  av encrypt -R team.txt app.json",
+		Args:    exactArgs(1, "exactly one FILE"),
+		RunE:    func(_ *cobra.Command, args []string) error { return c.runEncrypt(&o, args[0]) },
 	}
 	fs := cmd.Flags()
-	addFileFlag(fs, &o)
-	fs.StringVar(&o.from, "from", "", "encrypt the existing plain .env file at `PATH` (left untouched)")
-	fs.BoolVar(&o.force, "force", false, "overwrite an existing encrypted file")
+	fs.BoolVar(&o.force, "force", false, "overwrite an existing FILE.age")
 	addRecipientFlags(fs, &o, "encrypt")
-	addRecipientsPathFlag(fs, &o)
 	addIdentityFlag(fs, &o)
 	fs.Lookup("identity").Usage = "identity `PATH` whose public key is used when no recipients are given (repeatable)"
-	registerCompletions(cmd)
 	return cmd
 }
 
-func (c *CLI) runNew(o *options) error {
-	path := EncPath(o.file)
-	if fileExists(path) && !o.force {
-		return fmt.Errorf("%s already exists (use `av edit`, or --force to overwrite)", path)
+func (c *CLI) runEncrypt(o *options, input string) error {
+	out := input + ".age"
+	if fileExists(out) && !o.force {
+		return fmt.Errorf("%s already exists (use --force to overwrite)", out)
 	}
-
-	var plain []byte
-	stdin := c.Stdin
-	if o.from != "" {
-		data, err := os.ReadFile(o.from)
-		if err != nil {
-			return err
-		}
-		if err := dotenv.Validate(data); err != nil {
-			return fmt.Errorf("%s is not a valid .env file:\n%v", o.from, err)
-		}
-		plain = data
-	} else {
-		stdin = nil // reserved for the editor
-	}
-
-	t, err := o.newTarget(stdin)
+	data, err := os.ReadFile(input)
 	if err != nil {
 		return err
 	}
-
-	if o.from == "" {
-		content, changed, err := c.editor(path).Edit([]byte(newTemplate), dotenv.Validate)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			fmt.Fprintln(c.Stderr, "No changes made; nothing written.")
-			return nil
-		}
-		plain = content
+	if err := validatorFor(out)(data); err != nil {
+		return fmt.Errorf("%s is not a valid .env file:\n%v", input, err)
 	}
-	return c.save(path, plain, t)
+	t, err := o.newTarget(c.Stdin)
+	if err != nil {
+		return err
+	}
+	return c.save(out, data, t)
 }
 
 func (c *CLI) editCmd() *cobra.Command {
 	var o options
 	cmd := &cobra.Command{
-		Use:   "edit",
+		Use:   "edit [FILE]",
 		Short: "Edit an encrypted file in $EDITOR (re-encrypts on save)",
 		Long: `Decrypt the file into a private temporary file, open $VISUAL/$EDITOR
 (default vi) and re-encrypt it when you quit. Invalid content cannot be saved:
@@ -118,17 +92,22 @@ overwriting it.
 For vim and neovim, swap, backup, undo and viminfo files are turned off so
 no plaintext copy is left behind.
 
--r, -R and -p replace how the file is encrypted (-r and -R also update the recipients file).`,
-		Args: noArgs,
-		RunE: func(*cobra.Command, []string) error {
-			path := editPath(o.file)
-			resolve := func(info crypt.Info) (target, bool, error) {
+-r and -R replace how the file is encrypted for this save only; use
+"av recipients edit" to change the recipients file.`,
+		Args:              withFile(true, noArgs),
+		ValidArgsFunction: completeFile,
+		RunE: func(_ *cobra.Command, args []string) error {
+			o.takeFile(args, true)
+			path := EncPath(o.file)
+			resolve := func() (target, bool, error) {
 				// Stdin is reserved for the editor.
 				if t, ok, err := o.explicitTarget(nil); ok || err != nil {
 					return t, true, err
 				}
-				t, err := o.sameTarget(path, info)
-				return t, false, err
+				// Saving re-encrypts even if the content is unchanged, so an
+				// edit picks up the current recipients.
+				t, err := o.newTarget(nil)
+				return t, true, err
 			}
 			return c.update(&o, path, resolve, func(plain []byte) ([]byte, bool, error) {
 				return c.editor(path).Edit(plain, validatorFor(path))
@@ -136,35 +115,37 @@ no plaintext copy is left behind.
 		},
 	}
 	fs := cmd.Flags()
-	addFileFlag(fs, &o)
 	addIdentityFlag(fs, &o)
 	addRecipientFlags(fs, &o, "re-encrypt")
-	addRecipientsPathFlag(fs, &o)
-	registerCompletions(cmd)
 	return cmd
 }
 
 func (c *CLI) setCmd() *cobra.Command {
 	var o options
 	cmd := &cobra.Command{
-		Use:   "set KEY=VALUE... [KEY]",
+		Use:   "set KEY=VALUE... [FILE.age]",
 		Short: "Set variables without opening an editor",
 		Long: `Set variables, replacing existing lines in place and appending new ones.
 
 Values given as KEY=VALUE end up in your shell history. For secrets, give
 just KEY: the value is read without echo from the terminal, or from stdin
-when it is not a terminal (e.g. "pbpaste | av set API_KEY").`,
-		Args: minArgs(1, "KEY=VALUE or KEY"),
-		RunE: func(_ *cobra.Command, args []string) error { return c.runSet(&o, args) },
+when it is not a terminal (e.g. "pbpaste | av set API_KEY").
+
+The file is the last argument if it ends in ".age" (keys never contain dots).`,
+		Args: withFile(false, minArgs(1, "KEY=VALUE or KEY")),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return c.runSet(&o, o.takeFile(args, false))
+		},
 	}
-	addFileFlag(cmd.Flags(), &o)
 	addIdentityFlag(cmd.Flags(), &o)
-	addRecipientsPathFlag(cmd.Flags(), &o)
-	registerCompletions(cmd)
 	return cmd
 }
 
 func (c *CLI) runSet(o *options, args []string) error {
+	path := EncPath(o.file)
+	if err := requireEnv(path, "set"); err != nil {
+		return err
+	}
 	type kv struct{ key, value string }
 	var pairs []kv
 	fromStdin := false
@@ -183,8 +164,7 @@ func (c *CLI) runSet(o *options, args []string) error {
 		}
 		pairs = append(pairs, kv{key, value})
 	}
-	path := EncPath(o.file)
-	return c.update(o, path, o.keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
+	return c.update(o, path, keepTarget(o), func(plain []byte) ([]byte, bool, error) {
 		content := string(plain)
 		for _, p := range pairs {
 			var err error
@@ -214,13 +194,17 @@ func (c *CLI) readValue(key string) (string, error) {
 func (c *CLI) unsetCmd() *cobra.Command {
 	var o options
 	cmd := &cobra.Command{
-		Use:   "unset KEY...",
+		Use:   "unset KEY... [FILE.age]",
 		Short: "Remove variables",
-		Long:  "Remove variables. Fails, writing nothing, if any KEY is not set.",
-		Args:  minArgs(1, "at least one KEY"),
-		RunE: func(_ *cobra.Command, keys []string) error {
+		Long:  "Remove variables. Fails, writing nothing, if any KEY is not set.\n\nThe file is the last argument if it ends in \".age\".",
+		Args:  withFile(false, minArgs(1, "at least one KEY")),
+		RunE: func(_ *cobra.Command, args []string) error {
+			keys := o.takeFile(args, false)
 			path := EncPath(o.file)
-			return c.update(&o, path, o.keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
+			if err := requireEnv(path, "unset"); err != nil {
+				return err
+			}
+			return c.update(&o, path, keepTarget(&o), func(plain []byte) ([]byte, bool, error) {
 				content, missing, err := dotenv.Unset(string(plain), keys...)
 				if err != nil {
 					return nil, false, fmt.Errorf("%s: %v", path, err)
@@ -232,9 +216,6 @@ func (c *CLI) unsetCmd() *cobra.Command {
 			})
 		},
 	}
-	addFileFlag(cmd.Flags(), &o)
 	addIdentityFlag(cmd.Flags(), &o)
-	addRecipientsPathFlag(cmd.Flags(), &o)
-	registerCompletions(cmd)
 	return cmd
 }

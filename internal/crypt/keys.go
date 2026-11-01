@@ -17,9 +17,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// SecretPrompt asks the user for a secret. The argument is the prompt text.
-type SecretPrompt func(prompt string) ([]byte, error)
-
 // ParseRecipient parses a recipient string the same way the age CLI does,
 // except plugin recipients are not supported.
 func ParseRecipient(s string) (age.Recipient, error) {
@@ -112,57 +109,27 @@ func AgeIdentities(ids []Identity) []age.Identity {
 	return out
 }
 
-// LoadIdentityFile loads the identities in an age identity file (optionally
-// passphrase-encrypted) or an SSH private key. For encrypted SSH keys without
-// an embedded public key, name+".pub" is consulted.
-func LoadIdentityFile(name string, prompt SecretPrompt) ([]Identity, error) {
+// LoadIdentityFile loads the identities in an age identity file or an SSH
+// private key. Passphrase-protected files are an error.
+func LoadIdentityFile(name string) ([]Identity, error) {
 	data, err := os.ReadFile(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read identity file: %v", err)
 	}
-	return parseIdentityData(name, data, readPubLine(name), prompt)
+	return ParseIdentityData(name, data)
 }
 
 // ParseIdentityData parses identities given as content rather than a file,
-// e.g. from an environment variable. source is used in messages only.
-func ParseIdentityData(source string, data []byte, prompt SecretPrompt) ([]Identity, error) {
-	return parseIdentityData(source, data, "", prompt)
-}
-
-func parseIdentityData(name string, data []byte, pubLine string, prompt SecretPrompt) ([]Identity, error) {
+// e.g. from a secret manager. source is used in messages only.
+func ParseIdentityData(source string, data []byte) ([]Identity, error) {
 	trimmed := bytes.TrimSpace(data)
-
 	switch {
-	// A passphrase-encrypted age identity file, plain or armored.
 	case bytes.HasPrefix(trimmed, []byte("age-encryption")) || bytes.HasPrefix(trimmed, []byte(armor.Header)):
-		var r io.Reader = bytes.NewReader(trimmed)
-		if bytes.HasPrefix(trimmed, []byte(armor.Header)) {
-			r = armor.NewReader(bytes.NewReader(trimmed))
-		}
-		pass, err := prompt(fmt.Sprintf("Enter passphrase for identity file %q:", name))
-		if err != nil {
-			return nil, err
-		}
-		sid, err := age.NewScryptIdentity(string(pass))
-		if err != nil {
-			return nil, err
-		}
-		d, err := age.Decrypt(r, sid)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt identity file %q: %v", name, err)
-		}
-		plain, err := io.ReadAll(d)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt identity file %q: %v", name, err)
-		}
-		return parseAgeIdentities(name, plain)
-
-	// An SSH private key.
+		return nil, fmt.Errorf("%q is encrypted with a passphrase, which av does not support", source)
 	case bytes.HasPrefix(trimmed, []byte("-----BEGIN")):
-		return parseSSHIdentity(name, trimmed, pubLine, prompt)
-
+		return parseSSHIdentity(source, trimmed)
 	default:
-		return parseAgeIdentities(name, data)
+		return parseAgeIdentities(source, data)
 	}
 }
 
@@ -185,50 +152,16 @@ func parseAgeIdentities(name string, data []byte) ([]Identity, error) {
 	return ids, nil
 }
 
-func parseSSHIdentity(name string, pemBytes []byte, pubLine string, prompt SecretPrompt) ([]Identity, error) {
+func parseSSHIdentity(name string, pemBytes []byte) ([]Identity, error) {
 	id, err := agessh.ParseIdentity(pemBytes)
 	var missing *ssh.PassphraseMissingError
 	if errors.As(err, &missing) {
-		pubKey := missing.PublicKey
-		if pubKey == nil {
-			if pubLine == "" {
-				return nil, fmt.Errorf("failed to obtain public key for SSH key %q: ensure %q exists", name, name+".pub")
-			}
-			pubKey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(pubLine))
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse %q: %v", name+".pub", err)
-			}
-		}
-		if pubLine == "" {
-			pubLine = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pubKey)))
-		}
-		eid, err := agessh.NewEncryptedSSHIdentity(pubKey, pemBytes, func() ([]byte, error) {
-			return prompt(fmt.Sprintf("Enter passphrase for %q:", name))
-		})
-		if err != nil {
-			return nil, err
-		}
-		return []Identity{{Identity: eid, Recipient: pubLine, Source: name}}, nil
+		return nil, fmt.Errorf("%q is passphrase-protected, which av does not support", name)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("malformed SSH identity in %q: %v", name, err)
 	}
-	if pubLine == "" {
-		pubLine = sshRecipientFromPrivate(pemBytes)
-	}
-	return []Identity{{Identity: id, Recipient: pubLine, Source: name}}, nil
-}
-
-func readPubLine(name string) string {
-	data, err := os.ReadFile(name + ".pub")
-	if err != nil {
-		return ""
-	}
-	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
-	if _, err := agessh.ParseRecipient(line); err != nil {
-		return ""
-	}
-	return line
+	return []Identity{{Identity: id, Recipient: sshRecipientFromPrivate(pemBytes), Source: name}}, nil
 }
 
 func sshRecipientFromPrivate(pemBytes []byte) string {
