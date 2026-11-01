@@ -1,7 +1,9 @@
 # av design
 
 `av` keeps `.env` files encrypted with [age](https://age-encryption.org) so they
-can be committed, and lets you edit, read and use them from the terminal. This
+can be committed, and lets you edit, read and use them from the terminal. `edit`
+and `print` also work on any other `*.age` file (saved without the `KEY=VALUE`
+check). This
 document is a map of the code: what lives where, how the pieces fit together
 and which rules must not be broken. Read it before changing anything; it should
 tell you which file to open.
@@ -45,12 +47,12 @@ keys), `golang.org/x/term` (no-echo input), `spf13/cobra` + `pflag` (CLI).
 | File | Contents |
 |---|---|
 | `cli.go` | `CLI` struct (injected streams), `Run` (error → exit code), root command, command groups, `help`/`version` commands, `confirm` prompt |
-| `flags.go` | `options` (every flag of every command), `add*Flag` helpers, flag completion, positional-argument validators, `EncPath`, small helpers |
+| `flags.go` | `options` (every flag of every command), `add*Flag` helpers, flag completion, positional-argument validators, `EncPath` and `editPath` (file names), small helpers |
 | `cmd_edit.go` | `new`, `edit`, `set`, `unset`, plus `readValue` (hidden input for `set KEY`) |
 | `cmd_use.go` | `print`, `get`, `export`, `run` (`runWithEnv`: child process, signal forwarding, exit status) |
-| `cmd_access.go` | `recipients [list\|add\|rm]`, `rekey` |
+| `cmd_access.go` | `recipients [list\|print\|add\|rm]`, `rekey` |
 | `update.go` | `update`, the read-modify-write pipeline; `decrypt`; `entries` |
-| `target.go` | `target` (how to encrypt), choosing it (`explicitTarget`, `newTarget`, `sameTarget`), recipients file read/write, `save` |
+| `target.go` | `target` (how to encrypt), choosing it (`explicitTarget`, `newTarget`, `sameTarget`), recipients file lookup (`recipientsFile`) and read/write, `save` |
 | `identities.go` | `loadIdentities` (`-i`, else `identity.Load`), the `/dev/tty` prompt, `noIdentityHint` |
 | `cli_test.go` | end-to-end tests through `CLI.Run` |
 
@@ -61,9 +63,10 @@ command bodies are split into `runXxx` methods.
 ## Core flows
 
 ### Reading: `print`, `get`, `export`, `run`
-`options.decrypt(path)` → `crypt.Decrypt`. For `get`, `export` and `run`,
-`options.entries()` also parses the content with `dotenv.Parse` and refuses
-files with invalid lines.
+`options.decrypt(path)` → `crypt.Decrypt`. `print` uses `editPath(-f)` and writes
+the plaintext as is, for any age file. `get`, `export` and `run` use
+`EncPath` and `options.entries()`, which also parses the content with
+`dotenv.Parse` and refuses files with invalid lines.
 
 `crypt.Decrypt` looks at the age header. A passphrase (scrypt) file prompts
 for the passphrase; any other file loads identities **lazily** through a
@@ -85,8 +88,13 @@ All of them go through **`CLI.update(o, path, resolve, change)`** in
 6. `save`.
 
 To add another command that modifies a file, write a `resolve` (usually
-`keepTarget(path, force)`) and a `change` func. Don't write your own
+`o.keepTarget(path, force)`) and a `change` func. Don't write your own
 decrypt/encrypt sequence.
+
+`edit` validates the saved content with `dotenv.Validate` only for `*.env.age`
+files (`validatorFor`). Other age files are saved as they are. The editor's temp
+file is named after the plaintext (`.env`, `README.md`) so editors pick the
+right syntax.
 
 ### Creating: `new`
 `runNew`: refuse if the file exists (unless `--force`) → content from
@@ -94,19 +102,24 @@ decrypt/encrypt sequence.
 lost-update check because there's no previous version.
 
 ### Targets: who a file is encrypted for (`target.go`)
-`target{recipients, lines, writeSidecar}`. `lines == nil` means a passphrase.
+`target{recipients, lines, writeTo}`. `lines == nil` means a passphrase.
 
 * `explicitTarget`: `-p`, or `-r`/`-R` (written to the recipients file).
   Returns `ok=false` when none of these flags were given.
-* `newTarget` (new files): explicit flags → an existing `<file>.recipients`
+* `newTarget` (new files): explicit flags → the recipients file
   → the public key of the user's first identity.
 * `sameTarget` (existing files): keep the passphrase if the file has one,
-  else use `<file>.recipients`; it's an error if that file is missing (age
+  else use the recipients file; it's an error if that file is missing (age
   files don't reveal their recipients).
+* `recipientsFile` (the recipients file for every target): `--recipients-path`,
+  else `$AV_RECIPIENTS`, else the first existing `recipients.txt` in the current
+  directory or in the directory of a default `keys.txt`. If none exists, the path
+  is `./recipients.txt`, and a save creates it.
 
-`save` encrypts, then **updates the recipients file before the encrypted
-file** (it deletes the recipients file for passphrase targets), writes the
-encrypted file atomically, and **prints the recipients**.
+`save` encrypts, then **writes the recipients file before the encrypted file**
+when the target has `writeTo` set (explicit `-r`/`-R`, or a new file's own key).
+Passphrase saves never touch the recipients file. It then writes the encrypted
+file atomically and **prints the recipients**.
 
 ### Identities (`internal/identity`)
 `identity.Load(files, data, prompt)`, used by `cli` (files = `-i`) and
@@ -133,14 +146,16 @@ SIGTERM/SIGHUP (and on SIGINT when the editor isn't running) and exits 130.
 * **`X.env.age`**: a standard age file, binary, no armor. `age -d` can
   decrypt it. Armored files (from `age -a`) are still read and are rewritten
   as binary on the next save. Mode 0600.
-* **`X.env.age.recipients`**: one recipient per line (`age1…`, `ssh-ed25519 …`,
+* **`recipients.txt`**: one recipient per line (`age1…`, `ssh-ed25519 …`,
   `ssh-rsa …`, `age1pq1…`, `age1tag1…`), `#` comments, first line is a
   "managed by av" header. Public keys only; meant to be committed. Mode 0644.
-  Its absence means "passphrase file" or "unknown".
+  Shared by all files; found via `recipientsFile` (flag, `$AV_RECIPIENTS`,
+  cwd, then the directory of `keys.txt`). Passphrase saves leave it alone.
 * **Plaintext** (`dotenv`): `[export ]KEY=VALUE` lines, `#` comments, single
   quotes (literal), double quotes (`\n \t \r \" \\ \$ \``), unquoted values
   with ` #` inline comments, no `$VAR` expansion, duplicate keys rejected.
-  `EncPath` maps any `-f` value onto the `*.env.age` naming.
+  `EncPath` maps a `-f` value onto the `*.env.age` naming. `editPath` (used by
+  `edit` and `print`) keeps an existing `*.age` file as given.
 
 ## Invariants (don't break these)
 

@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/oneryx/av/internal/crypt"
@@ -14,7 +15,7 @@ import (
 func (c *CLI) recipientsCmd() *cobra.Command {
 	var o options
 	list := func(*cobra.Command, []string) error {
-		lines, err := readSidecar(EncPath(o.file))
+		lines, _, err := o.readRecipients()
 		if err != nil {
 			return err
 		}
@@ -25,9 +26,12 @@ func (c *CLI) recipientsCmd() *cobra.Command {
 	}
 	cmd := &cobra.Command{
 		Use:   "recipients",
-		Short: "List, add or remove the recipients of a file",
-		Long: `List the recipients in <file>.recipients (the default), or add or remove
-some and re-encrypt the file.
+		Short: "List, print, add or remove recipients",
+		Long: `List the recipients in the recipients file (the default), or add or remove
+some and re-encrypt the file. print shows the file's path and content.
+
+add and rm re-encrypt only the file given with -f. Other files that use the
+recipients file need av rekey.
 
 Removed recipients can still read old copies of the file (e.g. in git
 history), so rotate the secrets they had access to.`,
@@ -41,6 +45,7 @@ history), so rotate the secrets they had access to.`,
 	}
 	addFileFlag(cmd.PersistentFlags(), &o)
 	addIdentityFlag(cmd.PersistentFlags(), &o)
+	addRecipientsPathFlag(cmd.PersistentFlags(), &o)
 	registerCompletions(cmd)
 
 	cmd.AddCommand(&cobra.Command{
@@ -48,6 +53,23 @@ history), so rotate the secrets they had access to.`,
 		Short: "List the recipients",
 		Args:  noArgs,
 		RunE:  list,
+	}, &cobra.Command{
+		Use:   "print",
+		Short: "Print the path and content of the recipients file",
+		Args:  noArgs,
+		RunE: func(*cobra.Command, []string) error {
+			path, err := o.existingRecipientsFile()
+			if err != nil {
+				return err
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(c.Stdout, path)
+			_, err = c.Stdout.Write(data)
+			return err
+		},
 	}, &cobra.Command{
 		Use:     "add RECIPIENT...",
 		Short:   "Add recipients and re-encrypt",
@@ -70,7 +92,7 @@ history), so rotate the secrets they had access to.`,
 key without its comment, or just the SSH comment (e.g. "alice").`,
 		Args: minArgs(1, "at least one RECIPIENT"),
 		ValidArgsFunction: func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-			lines, _ := crypt.ReadRecipientsFile(sidecarPath(EncPath(o.file)))
+			lines, _, _ := o.readRecipients()
 			return recipientNames(lines), cobra.ShellCompDirectiveNoFileComp
 		},
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -90,7 +112,7 @@ key without its comment, or just the SSH comment (e.g. "alice").`,
 // re-encrypts the file for it.
 func (c *CLI) changeRecipients(o *options, edit func([]string) ([]string, error)) error {
 	path := EncPath(o.file)
-	lines, err := readSidecar(path)
+	lines, rp, err := o.readRecipients()
 	if err != nil {
 		return err
 	}
@@ -103,7 +125,7 @@ func (c *CLI) changeRecipients(o *options, edit func([]string) ([]string, error)
 		return nil
 	}
 	resolve := func(crypt.Info) (target, bool, error) {
-		t, err := recipientsTarget(updated, true)
+		t, err := recipientsTarget(updated, rp)
 		return t, true, err
 	}
 	return c.update(o, path, resolve, unchanged)
@@ -155,15 +177,17 @@ func recipientNames(lines []string) []string {
 
 func (c *CLI) rekeyCmd() *cobra.Command {
 	var o options
-	return readCmd(&o, &cobra.Command{
+	cmd := readCmd(&o, &cobra.Command{
 		Use:   "rekey",
 		Short: "Re-encrypt a file for its current recipients",
-		Long: `Re-encrypt the file for the recipients in <file>.recipients (or with its
+		Long: `Re-encrypt the file for the recipients in the recipients file (or with its
 passphrase), e.g. after pulling a recipients file a teammate changed.`,
 		Args: noArgs,
 		RunE: func(*cobra.Command, []string) error {
 			path := EncPath(o.file)
-			return c.update(&o, path, keepTarget(path, true), unchanged)
+			return c.update(&o, path, o.keepTarget(path, true), unchanged)
 		},
 	})
+	addRecipientsPathFlag(cmd.Flags(), &o)
+	return cmd
 }

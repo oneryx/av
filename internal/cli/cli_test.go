@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,10 @@ n=$(cat "$d/count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$d/count"
 	t.Setenv("AV_IDENTITY", keyFile)
 	t.Setenv("AV_IDENTITY_DATA", "")
 	t.Setenv("VISUAL", "")
+	// Keep the lookup for recipients.txt away from the real home directory.
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv(recipientsEnv, "")
 	t.Setenv("EDITOR", script)
 	return &env{t: t, dir: dir, key: key, keyFile: keyFile, contents: contents}
 }
@@ -108,6 +113,38 @@ func (e *env) mustRun(args ...string) string {
 	return out
 }
 
+func TestEditAnyAgeFile(t *testing.T) {
+	e := setup(t)
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, e.key.Recipient())
+	must(t, err)
+	_, err = w.Write([]byte("# Notes\n"))
+	must(t, err)
+	must(t, w.Close())
+	must(t, os.WriteFile("README.md.age", buf.Bytes(), 0o600))
+
+	// Not KEY=VALUE content: saved because only .env.age files are validated.
+	e.editorWrites("# Notes\n\nEdited.\n")
+	// No README.md.age.recipients exists, so the recipient must be given once.
+	e.mustRun("edit", "-f", "README.md.age", "-r", e.key.Recipient().String())
+
+	if _, err := os.Stat("README.md.env.age"); err == nil {
+		t.Fatal("edit created README.md.env.age instead of editing README.md.age")
+	}
+	data, err := os.ReadFile("README.md.age")
+	must(t, err)
+	r, err := age.Decrypt(bytes.NewReader(data), e.key)
+	must(t, err)
+	plain, err := io.ReadAll(r)
+	must(t, err)
+	if string(plain) != "# Notes\n\nEdited.\n" {
+		t.Fatalf("README.md.age plaintext = %q", plain)
+	}
+	if got := e.mustRun("print", "-f", "README.md.age"); got != "# Notes\n\nEdited.\n" {
+		t.Fatalf("print README.md.age = %q", got)
+	}
+}
+
 func TestEncPath(t *testing.T) {
 	for in, want := range map[string]string{
 		"":                ".env.age",
@@ -139,8 +176,8 @@ func TestNewFromAndPrintExport(t *testing.T) {
 	if _, err := os.Stat(".env"); err != nil {
 		t.Fatal("--from file removed")
 	}
-	// Recipient derived from the identity is recorded in the sidecar.
-	side, _ := os.ReadFile(".env.age.recipients")
+	// Recipient derived from the identity is recorded in recipients.txt.
+	side, _ := os.ReadFile("recipients.txt")
 	if !strings.Contains(string(side), e.key.Recipient().String()) {
 		t.Fatalf("sidecar = %q", side)
 	}
@@ -170,7 +207,7 @@ func TestInteropWithAgeCLI(t *testing.T) {
 	}
 }
 
-func TestMultipleRecipientsAndSidecarReuse(t *testing.T) {
+func TestMultipleRecipientsAndFileReuse(t *testing.T) {
 	e := setup(t)
 	other, otherKey := newKey(t, e.dir, "other.txt")
 	recFile := filepath.Join(e.dir, "team.txt")
@@ -182,7 +219,7 @@ func TestMultipleRecipientsAndSidecarReuse(t *testing.T) {
 		t.Fatalf("other recipient print = %q", got)
 	}
 
-	// edit reuses the sidecar: both identities can still decrypt.
+	// edit reuses recipients.txt: both identities can still decrypt.
 	e.editorWrites("A=2\n")
 	e.mustRun("edit", "-f", "prod.env.age")
 	for _, k := range []string{e.keyFile, otherKey} {
@@ -191,15 +228,15 @@ func TestMultipleRecipientsAndSidecarReuse(t *testing.T) {
 		}
 	}
 
-	// -r on edit replaces the recipients and rewrites the sidecar.
+	// -r on edit replaces the recipients and rewrites recipients.txt.
 	e.editorWrites()
 	e.mustRun("edit", "-f", "prod", "-r", e.key.Recipient().String())
 	if code, _, _ := e.run("", "print", "-f", "prod", "-i", otherKey); code == 0 {
 		t.Fatal("removed recipient can still decrypt")
 	}
-	side, _ := os.ReadFile("prod.env.age.recipients")
+	side, _ := os.ReadFile("recipients.txt")
 	if strings.Contains(string(side), other.Recipient().String()) {
-		t.Fatalf("sidecar not updated: %q", side)
+		t.Fatalf("recipients.txt not updated: %q", side)
 	}
 }
 
@@ -254,11 +291,11 @@ func TestNewWithEditor(t *testing.T) {
 	}
 }
 
-func TestEditWithoutSidecar(t *testing.T) {
+func TestEditWithoutRecipientsFile(t *testing.T) {
 	e := setup(t)
 	e.write("plain", "A=1\n")
 	e.mustRun("new", "--from", "plain")
-	os.Remove(".env.age.recipients")
+	os.Remove("recipients.txt")
 	if code, _, errs := e.run("", "edit"); code == 0 || !strings.Contains(errs, "pass -r or -R") {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
@@ -363,7 +400,7 @@ func TestConcurrentChangeDetected(t *testing.T) {
 	}
 }
 
-func TestPassphraseSaveRemovesSidecar(t *testing.T) {
+func TestPassphraseSaveKeepsRecipientsFile(t *testing.T) {
 	e := setup(t)
 	e.write("plain", "A=1\n")
 	e.mustRun("new", "--from", "plain")
@@ -371,8 +408,9 @@ func TestPassphraseSaveRemovesSidecar(t *testing.T) {
 	must(t, err)
 	c := &CLI{Stderr: new(bytes.Buffer)}
 	must(t, c.save(".env.age", []byte("A=1\n"), tg))
-	if _, err := os.Stat(".env.age.recipients"); err == nil {
-		t.Fatal("stale recipients file kept for a passphrase file")
+	// recipients.txt is shared by all files, so a passphrase save leaves it alone.
+	if _, err := os.Stat("recipients.txt"); err != nil {
+		t.Fatalf("recipients.txt removed by passphrase save: %v", err)
 	}
 }
 
@@ -447,7 +485,7 @@ func TestRecipientsAddRmRekey(t *testing.T) {
 	}
 
 	// rekey picks up a recipients file changed by hand (e.g. by a git pull).
-	e.write(".env.age.recipients", other.Recipient().String()+"\n")
+	e.write("recipients.txt", other.Recipient().String()+"\n")
 	e.mustRun("rekey")
 	if got := e.mustRun("print", "-i", otherKey); got != "A=1\n" {
 		t.Fatalf("after rekey: %q", got)
@@ -493,5 +531,62 @@ func TestIdentityEnv(t *testing.T) {
 	t.Setenv("AV_IDENTITY", "/nonexistent/key")
 	if code, _, _ := e.run("", "print"); code == 0 {
 		t.Fatal("missing $AV_IDENTITY file should be an error")
+	}
+}
+
+func TestRecipientsPrint(t *testing.T) {
+	e := setup(t)
+	if code, _, errs := e.run("", "recipients", "print"); code == 0 || !strings.Contains(errs, "not found") {
+		t.Fatalf("exit %d, stderr %q", code, errs)
+	}
+	content := "# Recipients managed by av. Safe to commit.\n" + e.key.Recipient().String() + "\n"
+	e.write("recipients.txt", content)
+	if got := e.mustRun("recipients", "print"); got != "recipients.txt\n"+content {
+		t.Fatalf("print = %q, want path %q and content %q", got, "recipients.txt", content)
+	}
+}
+
+func TestRecipientsFileLookupOrder(t *testing.T) {
+	e := setup(t)
+	keysDir := filepath.Join(e.dir, "home", ".config", "age")
+	must(t, os.MkdirAll(keysDir, 0o700))
+	must(t, os.WriteFile(filepath.Join(keysDir, "keys.txt"), []byte(e.key.String()+"\n"), 0o600))
+	// One distinct recipient per location, so the output shows which was used.
+	atKeys, _ := newKey(t, keysDir, "k1.txt")
+	atCwd, _ := newKey(t, e.dir, "k2.txt")
+	atEnv, _ := newKey(t, e.dir, "k3.txt")
+	atArg, _ := newKey(t, e.dir, "k4.txt")
+	write := func(path string, k *age.X25519Identity) {
+		t.Helper()
+		must(t, os.WriteFile(path, []byte(k.Recipient().String()+"\n"), 0o644))
+	}
+	list := func(args ...string) string {
+		t.Helper()
+		return e.mustRun(append([]string{"recipients", "list"}, args...)...)
+	}
+
+	// Next to keys.txt when the current directory has none.
+	write(filepath.Join(keysDir, "recipients.txt"), atKeys)
+	if got := list(); got != atKeys.Recipient().String()+"\n" {
+		t.Fatalf("keys dir not used: %q", got)
+	}
+
+	// The current directory comes first.
+	write("recipients.txt", atCwd)
+	if got := list(); got != atCwd.Recipient().String()+"\n" {
+		t.Fatalf("current directory not used first: %q", got)
+	}
+
+	// $AV_RECIPIENTS overrides the search.
+	write("env.txt", atEnv)
+	t.Setenv(recipientsEnv, filepath.Join(e.dir, "env.txt"))
+	if got := list(); got != atEnv.Recipient().String()+"\n" {
+		t.Fatalf("$AV_RECIPIENTS not used: %q", got)
+	}
+
+	// --recipients-path overrides $AV_RECIPIENTS.
+	write("arg.txt", atArg)
+	if got := list("--recipients-path", "arg.txt"); got != atArg.Recipient().String()+"\n" {
+		t.Fatalf("--recipients-path not used: %q", got)
 	}
 }

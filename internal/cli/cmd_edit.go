@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/oneryx/av/internal/crypt"
@@ -22,8 +23,20 @@ const newTemplate = `# One KEY=VALUE per line. Lines starting with # are comment
 # DATABASE_URL=postgres://user:pass@localhost/db
 `
 
-func (c *CLI) editor() *editor.Editor {
-	return &editor.Editor{Name: ".env", In: c.input(), Out: c.Stderr}
+// editor returns an editor whose temp file is named after the plaintext of
+// path (".env" for .env.age, "README.md" for README.md.age) so editors pick
+// the right syntax.
+func (c *CLI) editor(path string) *editor.Editor {
+	return &editor.Editor{Name: strings.TrimSuffix(filepath.Base(path), ".age"), In: c.input(), Out: c.Stderr}
+}
+
+// validatorFor checks .env content for .env.age files; any other age file is
+// saved as is.
+func validatorFor(path string) func([]byte) error {
+	if strings.HasSuffix(path, ".env.age") {
+		return dotenv.Validate
+	}
+	return func([]byte) error { return nil }
 }
 
 func (c *CLI) newCmd() *cobra.Command {
@@ -34,8 +47,8 @@ func (c *CLI) newCmd() *cobra.Command {
 		Long: `Create an encrypted file. Without --from, $VISUAL/$EDITOR (default vi) is
 opened on a template; the content must be valid KEY=VALUE lines to be saved.
 
-Recipients are chosen from -r/-R, then an existing <file>.recipients, then
-the public key of your identity. "-R -" (stdin) only works with --from.`,
+Recipients are chosen from -r/-R, then the recipients file (see --recipients-path),
+then the public key of your identity. "-R -" (stdin) only works with --from.`,
 		Args: noArgs,
 		RunE: func(*cobra.Command, []string) error { return c.runNew(&o) },
 	}
@@ -44,6 +57,7 @@ the public key of your identity. "-R -" (stdin) only works with --from.`,
 	fs.StringVar(&o.from, "from", "", "encrypt the existing plain .env file at `PATH` (left untouched)")
 	fs.BoolVar(&o.force, "force", false, "overwrite an existing encrypted file")
 	addRecipientFlags(fs, &o, "encrypt")
+	addRecipientsPathFlag(fs, &o)
 	addIdentityFlag(fs, &o)
 	fs.Lookup("identity").Usage = "identity `PATH` whose public key is used when no recipients are given (repeatable)"
 	registerCompletions(cmd)
@@ -71,13 +85,13 @@ func (c *CLI) runNew(o *options) error {
 		stdin = nil // reserved for the editor
 	}
 
-	t, err := o.newTarget(path, stdin)
+	t, err := o.newTarget(stdin)
 	if err != nil {
 		return err
 	}
 
 	if o.from == "" {
-		content, changed, err := c.editor().Edit([]byte(newTemplate), dotenv.Validate)
+		content, changed, err := c.editor(path).Edit([]byte(newTemplate), dotenv.Validate)
 		if err != nil {
 			return err
 		}
@@ -104,20 +118,20 @@ overwriting it.
 For vim and neovim, swap, backup, undo and viminfo files are turned off so
 no plaintext copy is left behind.
 
--r, -R and -p replace how the file is encrypted (and update <file>.recipients).`,
+-r, -R and -p replace how the file is encrypted (-r and -R also update the recipients file).`,
 		Args: noArgs,
 		RunE: func(*cobra.Command, []string) error {
-			path := EncPath(o.file)
+			path := editPath(o.file)
 			resolve := func(info crypt.Info) (target, bool, error) {
 				// Stdin is reserved for the editor.
 				if t, ok, err := o.explicitTarget(nil); ok || err != nil {
 					return t, true, err
 				}
-				t, err := sameTarget(path, info)
+				t, err := o.sameTarget(path, info)
 				return t, false, err
 			}
 			return c.update(&o, path, resolve, func(plain []byte) ([]byte, bool, error) {
-				return c.editor().Edit(plain, dotenv.Validate)
+				return c.editor(path).Edit(plain, validatorFor(path))
 			})
 		},
 	}
@@ -125,6 +139,7 @@ no plaintext copy is left behind.
 	addFileFlag(fs, &o)
 	addIdentityFlag(fs, &o)
 	addRecipientFlags(fs, &o, "re-encrypt")
+	addRecipientsPathFlag(fs, &o)
 	registerCompletions(cmd)
 	return cmd
 }
@@ -144,6 +159,7 @@ when it is not a terminal (e.g. "pbpaste | av set API_KEY").`,
 	}
 	addFileFlag(cmd.Flags(), &o)
 	addIdentityFlag(cmd.Flags(), &o)
+	addRecipientsPathFlag(cmd.Flags(), &o)
 	registerCompletions(cmd)
 	return cmd
 }
@@ -168,7 +184,7 @@ func (c *CLI) runSet(o *options, args []string) error {
 		pairs = append(pairs, kv{key, value})
 	}
 	path := EncPath(o.file)
-	return c.update(o, path, keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
+	return c.update(o, path, o.keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
 		content := string(plain)
 		for _, p := range pairs {
 			var err error
@@ -204,7 +220,7 @@ func (c *CLI) unsetCmd() *cobra.Command {
 		Args:  minArgs(1, "at least one KEY"),
 		RunE: func(_ *cobra.Command, keys []string) error {
 			path := EncPath(o.file)
-			return c.update(&o, path, keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
+			return c.update(&o, path, o.keepTarget(path, false), func(plain []byte) ([]byte, bool, error) {
 				content, missing, err := dotenv.Unset(string(plain), keys...)
 				if err != nil {
 					return nil, false, fmt.Errorf("%s: %v", path, err)
@@ -218,6 +234,7 @@ func (c *CLI) unsetCmd() *cobra.Command {
 	}
 	addFileFlag(cmd.Flags(), &o)
 	addIdentityFlag(cmd.Flags(), &o)
+	addRecipientsPathFlag(cmd.Flags(), &o)
 	registerCompletions(cmd)
 	return cmd
 }
