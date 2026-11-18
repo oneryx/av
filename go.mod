@@ -5,9 +5,9 @@ go 1.27.2
 require (
 	filippo.io/age v1.3.2
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.10
-	golang.org/x/crypto v0.58.0
-	golang.org/x/term v0.47.0
+	github.com/spf13/pflag v1.1.0
+	golang.org/x/crypto v0.59.0
+	golang.org/x/term v0.48.0
 )
 
 require (
@@ -15,5 +15,5 @@ require (
 	filippo.io/hpke v0.4.0 // indirect
 	filippo.io/nistec v0.0.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
